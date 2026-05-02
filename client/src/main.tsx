@@ -1,0 +1,1383 @@
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createRoot } from "react-dom/client";
+import Editor from "@monaco-editor/react";
+import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { diffLines } from "diff";
+import {
+  Bot,
+  Check,
+  ArrowDown,
+  ArrowUp,
+  ChevronDown,
+  Clipboard,
+  Copy,
+  Download,
+  FilePlus,
+  History,
+  ListPlus,
+  Moon,
+  Plus,
+  RefreshCw,
+  Save,
+  Settings,
+  Trash2,
+  X
+} from "lucide-react";
+import { cloneLog, parseUpdateLog, serializeUpdateLog } from "../../shared/markdown";
+import { splitDiscordMessages } from "../../shared/splitter";
+import type { AiEditResponse, AppSettings, DraftRecord, LogItem, UpdateLog, VersionRecord } from "../../shared/types";
+import "./styles.css";
+
+type DraftsResponse = { drafts: DraftRecord[] };
+type DraftResponse = { draft: DraftRecord };
+type SettingsResponse = { settings: AppSettings };
+type VersionsResponse = { versions: VersionRecord[] };
+type SaveVersionResponse = { version: VersionRecord; draft: DraftRecord };
+type SelectOption = { value: string; label: string; meta?: string };
+type EditorTab = "raw" | "structured";
+type SideTab = "preview" | "split" | "ai" | "history" | "settings";
+type SlideDirection = "slideForward" | "slideBack";
+type AmbientGlow = {
+  id: number;
+  color: string;
+  size: string;
+  x: string;
+  y: string;
+  dx: string;
+  dy: string;
+  duration: string;
+};
+const sectionMenuOptionsLimit = 12;
+const everyoneFooter = "-# ||@everyone||";
+const editorTabOrder: EditorTab[] = ["raw", "structured"];
+const sideTabOrder: SideTab[] = ["preview", "split", "ai", "history", "settings"];
+const codexStatusQueryOptions = {
+  staleTime: 30_000,
+  refetchOnWindowFocus: false
+};
+
+const queryClient = new QueryClient();
+async function api<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(path, {
+    ...options,
+    headers: { "Content-Type": "application/json", ...(options?.headers ?? {}) }
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({}));
+    throw new Error(body.error ?? `${response.status} ${response.statusText}`);
+  }
+  if (response.status === 204) return undefined as T;
+  return response.json() as Promise<T>;
+}
+
+function download(filename: string, text: string) {
+  const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
+}
+
+function copyText(text: string) {
+  return navigator.clipboard.writeText(text);
+}
+
+function hasEveryoneFooter(value: string) {
+  return value.split("\n").some((line) => line.trim() === everyoneFooter);
+}
+
+function setEveryoneFooter(value: string, enabled: boolean) {
+  const remaining = value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line && line !== everyoneFooter);
+  if (enabled) {
+    remaining.push(everyoneFooter);
+  }
+  return remaining.join("\n");
+}
+
+function displayModelName(model: string) {
+  return model.replace(/\bgpt\b/gi, "GPT").replace(/\bgpt-/gi, "GPT-");
+}
+
+function draftNameFromUpdateTitle(title: string) {
+  const withoutHeading = title.replace(/^#+\s*/, "");
+  const withoutEmoji = withoutHeading.replace(/:[A-Za-z0-9_+-]+:/g, "").replace(/\s+/g, " ").trim();
+  const withoutUpdateSuffix = withoutEmoji.replace(/\s+UPDATE$/i, "").trim();
+  return withoutUpdateSuffix || withoutEmoji || "Untitled Update";
+}
+
+function renderStructuredInlineMarkdown(value: string) {
+  const tokens = [
+    { marker: "**", className: "mdStrong" },
+    { marker: "__", className: "mdUnderline" },
+    { marker: "~~", className: "mdStrike" },
+    { marker: "||", className: "mdSpoiler" },
+    { marker: "`", className: "mdCode" },
+    { marker: "*", className: "mdEm" }
+  ];
+  const parts: React.ReactNode[] = [];
+  let index = 0;
+
+  while (index < value.length) {
+    const token = tokens.find((entry) => value.startsWith(entry.marker, index));
+    if (!token) {
+      parts.push(value[index]);
+      index += 1;
+      continue;
+    }
+
+    const contentStart = index + token.marker.length;
+    const contentEnd = value.indexOf(token.marker, contentStart);
+    if (contentEnd <= contentStart) {
+      parts.push(value[index]);
+      index += 1;
+      continue;
+    }
+
+    parts.push(<span key={`m-open-${index}`} className="mdMarker">{token.marker}</span>);
+    parts.push(<span key={`m-content-${index}`} className={token.className}>{value.slice(contentStart, contentEnd)}</span>);
+    parts.push(<span key={`m-close-${index}`} className="mdMarker">{token.marker}</span>);
+    index = contentEnd + token.marker.length;
+  }
+
+  return parts;
+}
+
+function MarkdownTextInput({
+  value,
+  onChange,
+  placeholder,
+  className
+}: {
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  className?: string;
+}) {
+  return (
+    <span className={`markdownTextInput ${className ?? ""}`}>
+      <span className="markdownTextPreview" aria-hidden="true">
+        {renderStructuredInlineMarkdown(value)}
+      </span>
+      <input
+        className="markdownTextControl"
+        value={value}
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    </span>
+  );
+}
+
+function App() {
+  const [selectedDraftId, setSelectedDraftId] = useState<string>("");
+  const [tab, setTab] = useState<EditorTab>("raw");
+  const [sideTab, setSideTab] = useState<SideTab>("preview");
+  const [editorSlideDirection, setEditorSlideDirection] = useState<SlideDirection>("slideForward");
+  const [sideSlideDirection, setSideSlideDirection] = useState<SlideDirection>("slideForward");
+  const [rawMarkdown, setRawMarkdown] = useState("");
+  const [structured, setStructured] = useState<UpdateLog>({ title: "", sections: [], footer: "" });
+  const [diagnostics, setDiagnostics] = useState<string[]>([]);
+  const [draftName, setDraftName] = useState("");
+  const [copyToast, setCopyToast] = useState("");
+  const [confirmDeleteDraftId, setConfirmDeleteDraftId] = useState<string | null>(null);
+  const [ambientGlows, setAmbientGlows] = useState<AmbientGlow[]>([]);
+  const [lastManualSaveAt, setLastManualSaveAt] = useState<string>("");
+  const queryClient = useQueryClient();
+
+  const createAmbientGlow = (id: number): AmbientGlow => {
+    const colors = [
+      "rgba(76,131,255,0.42)",
+      "rgba(36,161,222,0.34)",
+      "rgba(255,104,117,0.24)",
+      "rgba(155,115,255,0.30)"
+    ];
+    return {
+      id,
+      color: colors[Math.floor(Math.random() * colors.length)],
+      size: `${440 + Math.round(Math.random() * 360)}px`,
+      x: `${Math.round(-10 + Math.random() * 105)}vw`,
+      y: `${Math.round(-12 + Math.random() * 98)}vh`,
+      dx: `${Math.round(-22 + Math.random() * 44)}vw`,
+      dy: `${Math.round(-18 + Math.random() * 36)}vh`,
+      duration: `${15000 + Math.round(Math.random() * 8000)}ms`
+    };
+  };
+
+  useEffect(() => {
+    let nextId = 1;
+    const spawn = () => {
+      const glow = createAmbientGlow(nextId++);
+      setAmbientGlows((current) => [...current.slice(-3), glow]);
+      window.setTimeout(() => {
+        setAmbientGlows((current) => current.filter((entry) => entry.id !== glow.id));
+      }, Number.parseInt(glow.duration, 10) + 900);
+    };
+    spawn();
+    const interval = window.setInterval(spawn, 4300);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  const draftsQuery = useQuery({
+    queryKey: ["drafts"],
+    queryFn: () => api<DraftsResponse>("/api/drafts")
+  });
+  const settingsQuery = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => api<SettingsResponse>("/api/settings")
+  });
+  useQuery({
+    queryKey: ["codex-status"],
+    queryFn: () => api<any>("/api/codex/status"),
+    refetchOnMount: true,
+    ...codexStatusQueryOptions
+  });
+  const activeDraft = draftsQuery.data?.drafts.find((draft) => draft.id === selectedDraftId) ?? draftsQuery.data?.drafts[0];
+  const draftToDelete = draftsQuery.data?.drafts.find((draft) => draft.id === confirmDeleteDraftId);
+
+  const hydrateDraft = (draft: DraftRecord) => {
+    setRawMarkdown(draft.rawMarkdown);
+    setStructured(draft.structured);
+    setDraftName(draft.name);
+    setDiagnostics(parseUpdateLog(draft.rawMarkdown).diagnostics);
+  };
+
+  const selectDraft = (draft: DraftRecord) => {
+    if (draft.id === selectedDraftId) return;
+    const drafts = draftsQuery.data?.drafts ?? [];
+    const currentIndex = drafts.findIndex((entry) => entry.id === selectedDraftId);
+    const nextIndex = drafts.findIndex((entry) => entry.id === draft.id);
+    const direction: SlideDirection = currentIndex >= 0 && nextIndex > currentIndex ? "slideForward" : "slideBack";
+    setEditorSlideDirection(direction);
+    setSideSlideDirection(direction);
+    setSelectedDraftId(draft.id);
+    hydrateDraft(draft);
+  };
+
+  const switchEditorTab = (next: EditorTab) => {
+    if (next === tab) return;
+    setEditorSlideDirection(editorTabOrder.indexOf(next) > editorTabOrder.indexOf(tab) ? "slideForward" : "slideBack");
+    setTab(next);
+  };
+
+  const switchSideTab = (next: SideTab) => {
+    if (next === sideTab) return;
+    setSideSlideDirection(sideTabOrder.indexOf(next) > sideTabOrder.indexOf(sideTab) ? "slideForward" : "slideBack");
+    setSideTab(next);
+  };
+
+  useEffect(() => {
+    if (!selectedDraftId && draftsQuery.data?.drafts[0]) {
+      selectDraft(draftsQuery.data.drafts[0]);
+    }
+  }, [draftsQuery.data, selectedDraftId]);
+
+  useEffect(() => {
+    if (!activeDraft) return;
+    hydrateDraft(activeDraft);
+  }, [activeDraft?.id]);
+
+  const saveMutation = useMutation({
+    mutationFn: (payload: { name?: string; rawMarkdown: string; structured: UpdateLog }) =>
+      api<DraftResponse>(`/api/drafts/${selectedDraftId}`, {
+        method: "PUT",
+        body: JSON.stringify(payload)
+      }),
+    onSuccess: (data) => {
+      queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
+        if (!previous) return { drafts: [data.draft] };
+        return { drafts: previous.drafts.map((draft) => (draft.id === data.draft.id ? data.draft : draft)) };
+      });
+    }
+  });
+
+  useEffect(() => {
+    if (!selectedDraftId || !settingsQuery.data) return;
+    const timeout = window.setTimeout(() => {
+      saveMutation.mutate({ name: draftName, rawMarkdown, structured });
+    }, settingsQuery.data.settings.autosaveIntervalMs);
+    return () => window.clearTimeout(timeout);
+  }, [rawMarkdown, structured, draftName, selectedDraftId, settingsQuery.data?.settings.autosaveIntervalMs]);
+
+  const createDraft = useMutation({
+    mutationFn: () => api<DraftResponse>("/api/drafts", { method: "POST", body: JSON.stringify({ name: "Untitled Update" }) }),
+    onSuccess: (data) => {
+      queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
+        if (!previous) return { drafts: [data.draft] };
+        return { drafts: [data.draft, ...previous.drafts.filter((draft) => draft.id !== data.draft.id)] };
+      });
+      setDraftName(data.draft.name);
+      setRawMarkdown(data.draft.rawMarkdown);
+      setStructured(data.draft.structured);
+      setDiagnostics(parseUpdateLog(data.draft.rawMarkdown).diagnostics);
+      queryClient.invalidateQueries({ queryKey: ["drafts"] });
+      setSelectedDraftId(data.draft.id);
+    }
+  });
+
+  const duplicateDraft = useMutation({
+    mutationFn: (id: string) => api<DraftResponse>(`/api/drafts/${id}/duplicate`, { method: "POST" }),
+    onSuccess: (data) => {
+      queryClient.invalidateQueries({ queryKey: ["drafts"] });
+      setSelectedDraftId(data.draft.id);
+    }
+  });
+
+  const deleteDraft = useMutation({
+    mutationFn: (id: string) => api<void>(`/api/drafts/${id}`, { method: "DELETE" }),
+    onSuccess: (_data, deletedId) => {
+      setConfirmDeleteDraftId(null);
+      queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
+        if (!previous) return previous;
+        return { drafts: previous.drafts.filter((draft) => draft.id !== deletedId) };
+      });
+      if (selectedDraftId === deletedId) {
+        setSelectedDraftId("");
+      }
+      queryClient.invalidateQueries({ queryKey: ["drafts"] });
+    }
+  });
+
+  const updateSettings = useMutation({
+    mutationFn: (settings: AppSettings) => api<SettingsResponse>("/api/settings", { method: "PUT", body: JSON.stringify(settings) }),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["settings"], data);
+    }
+  });
+
+  const saveVersion = useMutation({
+    mutationFn: () => {
+      if (!selectedDraftId) throw new Error("No draft selected.");
+      const nextName = draftNameFromUpdateTitle(structured.title || draftName);
+      return api<SaveVersionResponse>(`/api/drafts/${selectedDraftId}/save-version`, {
+        method: "POST",
+        body: JSON.stringify({
+          label: "Manual save",
+          name: nextName,
+          rawMarkdown,
+          structured
+        })
+      });
+    },
+    onSuccess: (data) => {
+      setDraftName(data.draft.name);
+      setLastManualSaveAt(data.version.createdAt);
+      queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
+        if (!previous) return { drafts: [data.draft] };
+        const nextDrafts = previous.drafts.map((draft) => (draft.id === data.draft.id ? data.draft : draft));
+        if (!nextDrafts.some((draft) => draft.id === data.draft.id)) nextDrafts.unshift(data.draft);
+        return { drafts: nextDrafts };
+      });
+      queryClient.invalidateQueries({ queryKey: ["drafts"] });
+      queryClient.invalidateQueries({ queryKey: ["versions", data.draft.id] });
+    }
+  });
+
+  const updateFromRaw = useCallback((value: string) => {
+    setRawMarkdown(value);
+    const parsed = parseUpdateLog(value);
+    setStructured(parsed.log);
+    setDiagnostics(parsed.diagnostics);
+  }, []);
+
+  const updateStructured = useCallback((next: UpdateLog) => {
+    setStructured(next);
+    setRawMarkdown(serializeUpdateLog(next));
+    setDiagnostics([]);
+  }, []);
+
+  const splitResult = useMemo(() => {
+    const settings = settingsQuery.data?.settings;
+    return splitDiscordMessages(rawMarkdown, {
+      mode: settings?.characterLimitMode ?? "normal",
+      customLimit: settings?.customLimit,
+      continuationHeaders: settings?.continuationHeaders,
+      title: structured.title,
+      footer: structured.footer
+    });
+  }, [rawMarkdown, settingsQuery.data, structured.title, structured.footer]);
+
+  const toastCopy = async (text: string, label: string) => {
+    await copyText(text);
+    setCopyToast(label);
+    window.setTimeout(() => setCopyToast(""), 1300);
+  };
+
+  return (
+    <div className="app">
+      <div className="ambientGlows" aria-hidden="true">
+        {ambientGlows.map((glow) => (
+          <span
+            key={glow.id}
+            className="ambientGlow"
+            style={{
+              "--glow-color": glow.color,
+              "--glow-size": glow.size,
+              "--glow-x": glow.x,
+              "--glow-y": glow.y,
+              "--glow-dx": glow.dx,
+              "--glow-dy": glow.dy,
+              "--glow-duration": glow.duration
+            } as React.CSSProperties}
+          />
+        ))}
+      </div>
+      <aside className="sidebar">
+        <div className="brand">
+          <Moon size={20} />
+          <div>
+            <strong>Update Log Editor</strong>
+            <span>Discord patch notes</span>
+          </div>
+        </div>
+        <button className="primary" disabled={createDraft.isPending} onClick={() => createDraft.mutate()}>
+          <FilePlus size={16} /> {createDraft.isPending ? "Creating..." : "New Draft"}
+        </button>
+        <div className="draftList">
+          {draftsQuery.data?.drafts.map((draft) => (
+            <div key={draft.id} className={draft.id === selectedDraftId ? "draftRow active" : "draftRow"}>
+              <button className="draft" onClick={() => selectDraft(draft)}>
+                <span className="draftText">
+                  <strong>{draft.name}</strong>
+                  <span>{new Date(draft.updatedAt).toLocaleString()}</span>
+                </span>
+              </button>
+              <button
+                className="iconButton draftDeleteButton"
+                title={`Delete ${draft.name}`}
+                onClick={() => setConfirmDeleteDraftId(draft.id)}
+              >
+                <Trash2 size={14} />
+              </button>
+            </div>
+          ))}
+        </div>
+      </aside>
+
+      <main className="workspace">
+        <header className="topbar">
+          <input value={draftName} onChange={(event) => setDraftName(event.target.value)} className="titleInput" />
+          <div className="actions">
+            {copyToast && <span className="toast">{copyToast}</span>}
+            <button disabled={!selectedDraftId || saveVersion.isPending} title="Save version" onClick={() => saveVersion.mutate()}>
+              <Save size={16} /> {saveVersion.isPending ? "Saving..." : "Save"}
+            </button>
+            <button disabled={!selectedDraftId || duplicateDraft.isPending} title="Duplicate" onClick={() => selectedDraftId && duplicateDraft.mutate(selectedDraftId)}>
+              <Copy size={16} /> Duplicate
+            </button>
+            <button className="dangerButton" disabled={!selectedDraftId} title="Delete draft" onClick={() => selectedDraftId && setConfirmDeleteDraftId(selectedDraftId)}>
+              <Trash2 size={16} /> Delete
+            </button>
+          </div>
+        </header>
+
+        <section className="contentGrid">
+          <div className="editorPane">
+            <div className="tabs editorTabs">
+              <div className="editorTabButtons">
+                <button className={tab === "raw" ? "active" : ""} onClick={() => switchEditorTab("raw")}>Raw Markdown</button>
+                <button className={tab === "structured" ? "active" : ""} onClick={() => switchEditorTab("structured")}>Structured</button>
+              </div>
+              <button className="primary saveVersionTabButton" disabled={!selectedDraftId || saveVersion.isPending} onClick={() => saveVersion.mutate()}>
+                <Save size={15} /> {saveVersion.isPending ? "Saving..." : "Save Version"}
+              </button>
+            </div>
+            <div className={`editorMode ${tab === "raw" ? `active ${editorSlideDirection}` : "inactive"} monacoShell`} aria-hidden={tab !== "raw"}>
+                <Editor
+                  height="100%"
+                  defaultLanguage="markdown"
+                  theme="vs-dark"
+                  value={rawMarkdown}
+                  options={{
+                    minimap: { enabled: false },
+                    wordWrap: "on",
+                    fontSize: 14,
+                    lineHeight: 22,
+                    tabSize: 2,
+                    automaticLayout: true,
+                    padding: { top: 10, bottom: 18 },
+                    unicodeHighlight: {
+                      ambiguousCharacters: false,
+                      invisibleCharacters: false,
+                      nonBasicASCII: false
+                    }
+                  }}
+                  onChange={(value) => updateFromRaw(value ?? "")}
+                />
+              </div>
+              <div className={`editorMode ${tab === "structured" ? `active ${editorSlideDirection}` : "inactive"} structuredShell`} aria-hidden={tab !== "structured"}>
+                <StructuredEditor
+                  log={structured}
+                  onChange={updateStructured}
+                  onSave={() => saveVersion.mutate()}
+                  isSaving={saveVersion.isPending}
+                  lastSavedAt={lastManualSaveAt}
+                />
+              </div>
+            {diagnostics.length > 0 && (
+              <div className="diagnostics">
+                {diagnostics.slice(0, 4).map((diagnostic) => <span key={diagnostic}>{diagnostic}</span>)}
+              </div>
+            )}
+          </div>
+
+          <div className="sidePane">
+            <div className="tabs">
+              <button className={sideTab === "preview" ? "active" : ""} onClick={() => switchSideTab("preview")}>Preview</button>
+              <button className={sideTab === "split" ? "active" : ""} onClick={() => switchSideTab("split")}>Messages</button>
+              <button className={sideTab === "ai" ? "active" : ""} onClick={() => switchSideTab("ai")}><Bot size={14} /> AI</button>
+              <button className={sideTab === "history" ? "active" : ""} onClick={() => switchSideTab("history")}><History size={14} /> History</button>
+              <button className={sideTab === "settings" ? "active" : ""} onClick={() => switchSideTab("settings")}><Settings size={14} /> Settings</button>
+            </div>
+            <div className="sideContent">
+              <div className={`sideMode ${sideTab === "preview" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "preview"}>
+                <Preview rawMarkdown={rawMarkdown} />
+              </div>
+              <div className={`sideMode ${sideTab === "split" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "split"}>
+                <SplitPanel
+                  result={splitResult}
+                  onCopy={toastCopy}
+                  rawMarkdown={rawMarkdown}
+                  settings={settingsQuery.data?.settings}
+                  onTogglePartHeaders={(enabled) => {
+                    const current = settingsQuery.data?.settings;
+                    if (current) updateSettings.mutate({ ...current, continuationHeaders: enabled });
+                  }}
+                />
+              </div>
+              <div className={`sideMode ${sideTab === "ai" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "ai"}>
+                {activeDraft && <AiPanel draftId={activeDraft.id} rawMarkdown={rawMarkdown} structured={structured} onApply={updateStructured} />}
+              </div>
+              <div className={`sideMode ${sideTab === "history" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "history"}>
+                {activeDraft && <HistoryPanel draftId={activeDraft.id} />}
+              </div>
+              <div className={`sideMode ${sideTab === "settings" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "settings"}>
+                {settingsQuery.data && <SettingsPanel settings={settingsQuery.data.settings} />}
+              </div>
+            </div>
+          </div>
+        </section>
+        {draftToDelete && (
+          <div className="modalBackdrop" role="dialog" aria-modal="true">
+            <div className="confirmModal">
+              <h3>Delete Draft?</h3>
+              <p>This removes <strong>{draftToDelete.name}</strong> and its saved versions from this local app.</p>
+              <div className="modalActions">
+                <button onClick={() => setConfirmDeleteDraftId(null)}>Cancel</button>
+                <button className="dangerButton" disabled={deleteDraft.isPending} onClick={() => deleteDraft.mutate(draftToDelete.id)}>
+                  <Trash2 size={16} /> {deleteDraft.isPending ? "Deleting..." : "Delete Draft"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function CustomSelect({
+  value,
+  options,
+  onChange,
+  label,
+  compact = false,
+  dense = false,
+  buttonLabel,
+  buttonMeta
+}: {
+  value: string;
+  options: SelectOption[];
+  onChange: (value: string) => void;
+  label?: string;
+  compact?: boolean;
+  dense?: boolean;
+  buttonLabel?: string;
+  buttonMeta?: string;
+}) {
+  const [menuState, setMenuState] = useState<"closed" | "open" | "closing">("closed");
+  const closeTimer = useRef<number | null>(null);
+  const selected = options.find((option) => option.value === value) ?? options[0];
+  const open = menuState === "open";
+  const menuVisible = menuState !== "closed";
+
+  const clearCloseTimer = () => {
+    if (closeTimer.current !== null) {
+      window.clearTimeout(closeTimer.current);
+      closeTimer.current = null;
+    }
+  };
+
+  const openMenu = () => {
+    clearCloseTimer();
+    setMenuState("open");
+  };
+
+  const closeMenu = () => {
+    clearCloseTimer();
+    if (menuState === "closed") return;
+    setMenuState("closing");
+    closeTimer.current = window.setTimeout(() => {
+      setMenuState("closed");
+      closeTimer.current = null;
+    }, 150);
+  };
+
+  useEffect(() => () => clearCloseTimer(), []);
+
+  return (
+    <div
+      className={`${compact ? "customSelect compact" : "customSelect"}${dense ? " dense" : ""}`}
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+          closeMenu();
+        }
+      }}
+    >
+      {label && <span className="customSelectLabel">{label}</span>}
+      <button
+        type="button"
+        className={open ? "customSelectButton open" : "customSelectButton"}
+        onClick={() => (open ? closeMenu() : openMenu())}
+      >
+        <span>
+          <strong>{buttonLabel ?? selected?.label ?? "Select"}</strong>
+          {(buttonMeta ?? selected?.meta) && <small>{buttonMeta ?? selected?.meta}</small>}
+        </span>
+        <ChevronDown size={15} className="chevron" />
+      </button>
+      {menuVisible && (
+        <div className={menuState === "closing" ? "customSelectMenu closing" : "customSelectMenu open"} tabIndex={-1}>
+          {options.slice(0, sectionMenuOptionsLimit).map((option) => (
+            <button
+              type="button"
+              key={option.value}
+              className={option.value === value ? "selected" : ""}
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => {
+                onChange(option.value);
+                closeMenu();
+              }}
+            >
+              <span>{option.label}</span>
+              {option.meta && <small>{option.meta}</small>}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const StructuredEditor = React.memo(function StructuredEditor({
+  log,
+  onChange,
+  onSave,
+  isSaving,
+  lastSavedAt
+}: {
+  log: UpdateLog;
+  onChange: (log: UpdateLog) => void;
+  onSave: () => void;
+  isSaving: boolean;
+  lastSavedAt: string;
+}) {
+  const [activeSectionIndex, setActiveSectionIndex] = useState(0);
+  const structuredRef = useRef<HTMLDivElement>(null);
+  const collapsedSectionsRef = useRef<Set<number>>(new Set());
+  const sectionOptions = log.sections.map((section, index) => ({
+    value: String(index),
+    label: section.title || `Section ${index + 1}`,
+    meta: `${section.items.length} bullet${section.items.length === 1 ? "" : "s"}`
+  }));
+  const clampedActiveSectionIndex = Math.min(activeSectionIndex, Math.max(0, log.sections.length - 1));
+
+  const setLog = (mutator: (draft: UpdateLog) => void) => {
+    const next = cloneLog(log);
+    mutator(next);
+    onChange(next);
+  };
+
+  const moveSection = (index: number, direction: -1 | 1) => setLog((draft) => {
+    const target = index + direction;
+    if (target < 0 || target >= draft.sections.length) return;
+    const [section] = draft.sections.splice(index, 1);
+    draft.sections.splice(target, 0, section);
+  });
+
+  const moveItem = (sectionIndex: number, itemIndex: number, direction: -1 | 1) => setLog((draft) => {
+    const items = draft.sections[sectionIndex].items;
+    const target = itemIndex + direction;
+    if (target < 0 || target >= items.length) return;
+    const [item] = items.splice(itemIndex, 1);
+    items.splice(target, 0, item);
+  });
+
+  const moveItemToSection = (sectionIndex: number, itemIndex: number, targetSectionIndex: number) => setLog((draft) => {
+    if (sectionIndex === targetSectionIndex) return;
+    const sourceItems = draft.sections[sectionIndex].items;
+    const [item] = sourceItems.splice(itemIndex, 1);
+    draft.sections[targetSectionIndex].items.push(item);
+  });
+
+  const addBulletToSection = (sectionIndex = clampedActiveSectionIndex) => setLog((draft) => {
+    if (!draft.sections[sectionIndex]) {
+      draft.sections.push({ title: "GENERAL", items: [] });
+    }
+    draft.sections[sectionIndex].items.push({ text: "Added ", children: [], footers: [] });
+  });
+
+  const toggleSection = (sectionIndex: number, element: HTMLElement | null) => {
+    const collapsed = !collapsedSectionsRef.current.has(sectionIndex);
+    if (collapsed) collapsedSectionsRef.current.add(sectionIndex);
+    else collapsedSectionsRef.current.delete(sectionIndex);
+    element?.classList.toggle("collapsed", collapsed);
+  };
+
+  const collapseAll = () => {
+    collapsedSectionsRef.current = new Set(log.sections.map((_section, index) => index));
+    structuredRef.current?.querySelectorAll<HTMLElement>(".sectionEditor").forEach((section) => section.classList.add("collapsed"));
+  };
+  const expandAll = () => {
+    collapsedSectionsRef.current = new Set();
+    structuredRef.current?.querySelectorAll<HTMLElement>(".sectionEditor").forEach((section) => section.classList.remove("collapsed"));
+  };
+
+  return (
+    <div className="structured" ref={structuredRef}>
+      <div className="panelTitle">
+        <div>
+          <h3>Structure</h3>
+          <span>Sections, bullets, and footer</span>
+        </div>
+        <div className="panelTitleActions splitActions">
+          <span className="saveTimestamp">{lastSavedAt ? `Saved ${new Date(lastSavedAt).toLocaleString()}` : "No manual save yet"}</span>
+          <button className="softAction" onClick={expandAll}>Expand All</button>
+          <button className="softAction" onClick={collapseAll}>Collapse All</button>
+        </div>
+      </div>
+      <div className="structuredTop">
+        <label className="updateTitleField">
+          <span>Draft Title:</span>
+          <MarkdownTextInput className="updateTitleInput" value={log.title} onChange={(value) => setLog((draft) => { draft.title = value; })} />
+        </label>
+        <div className="structureStats">
+          <span>{log.sections.length} sections</span>
+          <span>{log.sections.reduce((total, section) => total + section.items.length, 0)} bullets</span>
+        </div>
+      </div>
+      <div className="stickyAddBar">
+        <CustomSelect
+          compact
+          dense
+          label="Add Bullet To"
+          value={String(clampedActiveSectionIndex)}
+          options={sectionOptions}
+          onChange={(value) => setActiveSectionIndex(Number(value))}
+        />
+        <button className="primary addBulletButton" onClick={() => addBulletToSection()}>
+          <Plus size={16} /> Add Bullet
+        </button>
+      </div>
+      {log.sections.map((section, sectionIndex) => (
+        <section key={`${section.title}-${sectionIndex}`} data-section-index={sectionIndex} className={collapsedSectionsRef.current.has(sectionIndex) ? "sectionEditor collapsed" : "sectionEditor"} onClick={() => setActiveSectionIndex(sectionIndex)}>
+          <div className="sectionSummary">
+            <div className="sectionHeading">
+              <button className="collapseToggle" title="Expand or collapse section" onClick={(event) => { event.stopPropagation(); toggleSection(sectionIndex, event.currentTarget.closest(".sectionEditor")); }}>
+                <ChevronDown size={16} className="collapseIcon" />
+              </button>
+              <MarkdownTextInput value={section.title} onChange={(value) => setLog((draft) => { draft.sections[sectionIndex].title = value; })} />
+              <span className="itemCount">{section.items.length} bullet{section.items.length === 1 ? "" : "s"}</span>
+            </div>
+            <div className="sectionActions">
+              <button className="iconButton moveButton" title="Move section down" onClick={() => moveSection(sectionIndex, 1)}><ArrowDown size={15} /></button>
+              <button className="iconButton moveButton" title="Move section up" onClick={() => moveSection(sectionIndex, -1)}><ArrowUp size={15} /></button>
+              <button className="iconButton dangerButton" title="Delete section" onClick={() => setLog((draft) => { draft.sections.splice(sectionIndex, 1); })}><X size={14} /></button>
+            </div>
+          </div>
+          <div className="sectionBody">
+            <div className="sectionBodyInner">
+              {section.items.map((item, itemIndex) => (
+                <div className="itemEditor" key={`${item.text}-${itemIndex}`}>
+                  <div className="itemLine">
+                    <span className="bulletMarker">•</span>
+                    <MarkdownTextInput value={item.text} onChange={(value) => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].text = value; })} />
+                    <div className="itemTools">
+                      <button className="iconButton moveButton" title="Move bullet down" onClick={() => moveItem(sectionIndex, itemIndex, 1)}><ArrowDown size={15} /></button>
+                      <button className="iconButton moveButton" title="Move bullet up" onClick={() => moveItem(sectionIndex, itemIndex, -1)}><ArrowUp size={15} /></button>
+                      {log.sections.length > 1 && (
+                        <CustomSelect
+                          compact
+                          dense
+                          value={String(sectionIndex)}
+                          options={sectionOptions}
+                          buttonLabel="Move to section"
+                          buttonMeta={section.title}
+                          onChange={(value) => moveItemToSection(sectionIndex, itemIndex, Number(value))}
+                        />
+                      )}
+                      <button className="iconButton dangerButton" title="Delete bullet" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items.splice(itemIndex, 1); })}><X size={14} /></button>
+                    </div>
+                  </div>
+                  {item.children.map((child, childIndex) => (
+                    <div className="childLine" key={`${child}-${childIndex}`}>
+                      <span className="nestedMarker">◦</span>
+                      <MarkdownTextInput value={child} onChange={(value) => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].children[childIndex] = value; })} />
+                      <button className="iconButton dangerButton" title="Delete nested bullet" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].children.splice(childIndex, 1); })}><X size={14} /></button>
+                    </div>
+                  ))}
+                  {(item.footers ?? []).map((footer, footerIndex) => (
+                    <div className="footerLine" key={`${footer}-${footerIndex}`}>
+                      <span className="footerMarker">-#</span>
+                      <MarkdownTextInput value={footer} placeholder="Subtext / footer under this bullet" onChange={(value) => setLog((draft) => {
+                        draft.sections[sectionIndex].items[itemIndex].footers ??= [];
+                        draft.sections[sectionIndex].items[itemIndex].footers![footerIndex] = value;
+                      })} />
+                      <button className="iconButton dangerButton" title="Delete subtext footer" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].footers?.splice(footerIndex, 1); })}><X size={14} /></button>
+                    </div>
+                  ))}
+                  <div className="itemAddRow">
+                    <button className="subtle" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].children.push(""); })}>
+                      <ListPlus size={14} /> Nested bullet
+                    </button>
+                    <button className="subtle" onClick={() => setLog((draft) => {
+                      draft.sections[sectionIndex].items[itemIndex].footers ??= [];
+                      draft.sections[sectionIndex].items[itemIndex].footers!.push("");
+                    })}>
+                      <Plus size={14} /> Subtext footer
+                    </button>
+                  </div>
+                </div>
+              ))}
+              <button className="subtle sectionAddButton" onClick={() => addBulletToSection(sectionIndex)}>
+                <Plus size={14} /> Add Bullet
+              </button>
+            </div>
+          </div>
+        </section>
+      ))}
+      <div className="floatingAddBullet">
+        <button className="primary addBulletButton" onClick={() => addBulletToSection()}>
+          <Plus size={16} /> Add Bullet
+        </button>
+      </div>
+      <button className="primary" onClick={() => setLog((draft) => { draft.sections.push({ title: "NEW SECTION", items: [] }); })}>
+        <Plus size={16} /> Section
+      </button>
+      <label className="settingToggle footerToggle">
+        <input
+          type="checkbox"
+          checked={hasEveryoneFooter(log.footer)}
+          onChange={(event) => setLog((draft) => { draft.footer = setEveryoneFooter(draft.footer, event.target.checked); })}
+        />
+        <span className="toggleBox"><Check size={18} /></span>
+        <span>
+          <strong>Everyone ping footer</strong>
+          <small>Automatically appends <code>{everyoneFooter}</code> at the bottom of the update log.</small>
+        </span>
+      </label>
+      <label className="footerField">
+        <span>
+          <strong>Bottom footer text</strong>
+          <small>Custom final subtext lines. The @everyone toggle above writes the common Discord ping for you.</small>
+        </span>
+        <textarea className="footerTextarea" value={log.footer} onChange={(event) => setLog((draft) => { draft.footer = event.target.value; })} />
+      </label>
+    </div>
+  );
+});
+
+const Preview = React.memo(function Preview({ rawMarkdown }: { rawMarkdown: string }) {
+  const [mode, setMode] = useState<"desktop" | "mobile" | "raw">("desktop");
+
+  return (
+    <div className="previewWrap">
+      <div className="previewToolbar">
+        <div className="toolbarGroup">
+          <span>Preview</span>
+          <div className="segmented">
+            <button className={mode === "desktop" ? "active" : ""} onClick={() => setMode("desktop")}>Desktop</button>
+            <button className={mode === "mobile" ? "active" : ""} onClick={() => setMode("mobile")}>Mobile</button>
+            <button className={mode === "raw" ? "active" : ""} onClick={() => setMode("raw")}>Raw</button>
+          </div>
+        </div>
+        <span>{rawMarkdown.length.toLocaleString()} characters</span>
+      </div>
+      {mode === "raw" ? (
+        <textarea readOnly value={rawMarkdown} className="rawExport standalone" />
+      ) : (
+        <div className={mode === "mobile" ? "discordSurface mobileMode" : "discordSurface"}>
+          <div className="discordChannelHeader"># update-log</div>
+          <div className="discordMessage">
+            <img className="discordAvatar" src="/bird-profile.png" alt="Bird profile" />
+            <div className="discordMessageBody">
+              <div className="discordMeta">
+                <strong>Bird</strong>
+                <span>Today at {new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</span>
+              </div>
+              <div className="discordPreview"><DiscordMarkdown raw={rawMarkdown} /></div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+});
+
+function DiscordMarkdown({ raw }: { raw: string }) {
+  const lines = raw.replace(/\r\n/g, "\n").split("\n");
+  const nodes: React.ReactNode[] = [];
+  let codeLines: string[] = [];
+  let inCode = false;
+
+  const flushCode = (key: number) => {
+    if (codeLines.length) {
+      nodes.push(<pre key={`code-${key}`}><code>{codeLines.join("\n")}</code></pre>);
+      codeLines = [];
+    }
+  };
+
+  lines.forEach((line, index) => {
+    if (line.trim().startsWith("```")) {
+      if (inCode) {
+        inCode = false;
+        flushCode(index);
+      } else {
+        inCode = true;
+      }
+      return;
+    }
+    if (inCode) {
+      codeLines.push(line);
+      return;
+    }
+    if (line.trim() === "") {
+      nodes.push(<div className="blankLine" key={index} />);
+      return;
+    }
+    if (line.startsWith("## ") && !line.startsWith("### ")) {
+      nodes.push(<h2 key={index}>{renderInline(line.slice(3))}</h2>);
+      return;
+    }
+    if (line.startsWith("### ")) {
+      nodes.push(<h3 key={index}>{renderInline(line.slice(4))}</h3>);
+      return;
+    }
+    if (line.startsWith("-# ")) {
+      nodes.push(<p className="subtext" key={index}>{renderInline(line.slice(3))}</p>);
+      return;
+    }
+    if (line.startsWith("  -# ")) {
+      nodes.push(<p className="subtext nestedSubtext" key={index}>{renderInline(line.slice(5))}</p>);
+      return;
+    }
+    if (line.startsWith("> ")) {
+      nodes.push(<blockquote key={index}>{renderInline(line.slice(2))}</blockquote>);
+      return;
+    }
+    if (line.startsWith("  - ")) {
+      nodes.push(<div className="previewBullet nested" key={index}><span>◦</span><p>{renderInline(line.slice(4))}</p></div>);
+      return;
+    }
+    if (line.startsWith("- ")) {
+      nodes.push(<div className="previewBullet" key={index}><span>•</span><p>{renderInline(line.slice(2))}</p></div>);
+      return;
+    }
+    nodes.push(<p key={index}>{renderInline(line)}</p>);
+  });
+  flushCode(lines.length + 1);
+  return <>{nodes}</>;
+}
+
+function renderInline(text: string): React.ReactNode[] {
+  const pattern = /(`[^`]+`|\|\|[^|]+\|\||\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
+  const parts: React.ReactNode[] = [];
+  let lastIndex = 0;
+  for (const match of text.matchAll(pattern)) {
+    if (match.index === undefined) continue;
+    if (match.index > lastIndex) parts.push(text.slice(lastIndex, match.index));
+    const token = match[0];
+    const key = `${match.index}-${token}`;
+    if (token.startsWith("`")) parts.push(<code key={key}>{token.slice(1, -1)}</code>);
+    else if (token.startsWith("||")) parts.push(<span className="spoiler" key={key}>{renderInline(token.slice(2, -2))}</span>);
+    else if (token.startsWith("**")) parts.push(<strong key={key}>{renderInline(token.slice(2, -2))}</strong>);
+    else if (token.startsWith("__")) parts.push(<u key={key}>{renderInline(token.slice(2, -2))}</u>);
+    else if (token.startsWith("~~")) parts.push(<s key={key}>{renderInline(token.slice(2, -2))}</s>);
+    else if (token.startsWith("*")) parts.push(<em key={key}>{renderInline(token.slice(1, -1))}</em>);
+    else {
+      const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      parts.push(link ? <a key={key} href={link[2]} target="_blank" rel="noreferrer">{renderInline(link[1])}</a> : token);
+    }
+    lastIndex = match.index + token.length;
+  }
+  if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+  return parts;
+}
+
+const SplitPanel = React.memo(function SplitPanel({
+  result,
+  onCopy,
+  rawMarkdown,
+  settings,
+  onTogglePartHeaders
+}: {
+  result: ReturnType<typeof splitDiscordMessages>;
+  onCopy: (text: string, label: string) => void;
+  rawMarkdown: string;
+  settings?: AppSettings;
+  onTogglePartHeaders: (enabled: boolean) => void;
+}) {
+  const structured = parseUpdateLog(rawMarkdown).log;
+  const splitIntoMultipleParts = result.chunks.length > 1;
+  const importJson = async (file: File | undefined) => {
+    if (!file) return;
+    const payload = JSON.parse(await file.text());
+    await api("/api/import", {
+      method: "POST",
+      body: JSON.stringify({
+        name: payload.name ?? payload.structured?.title ?? "Imported Update",
+        rawMarkdown: payload.rawMarkdown,
+        structured: payload.structured
+      })
+    });
+    window.location.reload();
+  };
+
+  return (
+    <div className="splitPanel">
+      <div className="panelTitle">
+        <div>
+          <h3>Discord Splitter</h3>
+          <span>Message parts and exports</span>
+        </div>
+      </div>
+      <div className="stats">
+        <span>Total {result.totalCharacters}</span>
+        <span>Limit {result.limit}</span>
+        <span>{result.chunks.length} message{result.chunks.length === 1 ? "" : "s"}</span>
+      </div>
+      <label className="settingToggle messageToggle">
+        <input
+          type="checkbox"
+          checked={!!settings?.continuationHeaders}
+          onChange={(event) => onTogglePartHeaders(event.target.checked)}
+        />
+        <span className="toggleBox"><Check size={18} /></span>
+        <span>
+          <strong>Part headers</strong>
+          <small>
+            {splitIntoMultipleParts
+              ? "Adds big PART 1/2 headings to each split Discord message."
+              : "Ready to add PART headings only if this log becomes more than one message."}
+          </small>
+        </span>
+      </label>
+      <div className="exportButtons">
+        <button onClick={() => onCopy(rawMarkdown, "Full log copied")}><Clipboard size={15} /> Copy full</button>
+        <button onClick={() => onCopy(result.chunks.join("\n\n---\n\n"), "All parts copied")}><Copy size={15} /> Copy all</button>
+        <button onClick={() => download("update-log.md", rawMarkdown)}><Download size={15} /> .md</button>
+        <button onClick={() => download("update-log.txt", rawMarkdown)}><Download size={15} /> .txt</button>
+        <button onClick={() => download("update-log-draft.json", JSON.stringify({ rawMarkdown, structured }, null, 2))}><Download size={15} /> JSON</button>
+        <label className="fileButton">Import JSON<input type="file" accept="application/json,.json" onChange={(event) => importJson(event.target.files?.[0])} /></label>
+      </div>
+      {result.warnings.map((warning) => <div className="warning" key={warning}>{warning}</div>)}
+      {result.chunks.map((chunk, index) => (
+        <article className="chunk" key={index}>
+          <header><strong>Part {index + 1}</strong><span>{chunk.length} chars</span><button onClick={() => onCopy(chunk, `Part ${index + 1} copied`)}><Copy size={14} /></button></header>
+          <pre>{chunk}</pre>
+        </article>
+      ))}
+    </div>
+  );
+});
+
+function AiPanel({ draftId, rawMarkdown, structured, onApply }: { draftId: string; rawMarkdown: string; structured: UpdateLog; onApply: (log: UpdateLog) => void }) {
+  const [instruction, setInstruction] = useState("");
+  const [modelMode, setModelMode] = useState("default");
+  const [customModel, setCustomModel] = useState("");
+  const [proposal, setProposal] = useState<(AiEditResponse & { updatedMarkdown: string }) | null>(null);
+  const codexStatus = useQuery({ queryKey: ["codex-status"], queryFn: () => api<any>("/api/codex/status"), ...codexStatusQueryOptions });
+  const codexDefaultModel = codexStatus.data?.defaultModel || "CLI configured model";
+  const modelOptions: SelectOption[] = [
+    { value: "default", label: "Use Codex default", meta: `Uses ${displayModelName(codexDefaultModel)}` },
+    { value: "gpt-5.5", label: "GPT-5.5", meta: "Newest listed option" },
+    { value: "gpt-5.4", label: "GPT-5.4", meta: "Fallback option" },
+    { value: "custom", label: "Custom model", meta: "Manual name" }
+  ];
+  const mutation = useMutation({
+    mutationFn: () => api<AiEditResponse & { updatedMarkdown: string }>("/api/codex/edit", {
+      method: "POST",
+      body: JSON.stringify({
+        draftId,
+        rawMarkdown,
+        draft: structured,
+        instruction,
+        model: modelMode === "custom" ? customModel : modelMode
+      })
+    }),
+    onSuccess: setProposal
+  });
+  const diff = proposal ? diffLines(rawMarkdown, proposal.updatedMarkdown) : [];
+
+  return (
+    <div className="aiPanel">
+      <div className="aiHero">
+        <div className="aiOrb"><Bot size={21} /></div>
+        <div>
+          <h3>Codex Edit</h3>
+          <p>Local CLI proposal</p>
+        </div>
+      </div>
+      <div className="aiComposer">
+        <label>Instruction
+          <textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="Polish this log, shorten a section, reorganize bullets, or apply notes without inventing changes." />
+        </label>
+        <div className="modelGrid">
+          <CustomSelect label="Model" value={modelMode} options={modelOptions} onChange={setModelMode} />
+          {modelMode === "custom" && <label>Custom<input value={customModel} onChange={(event) => setCustomModel(event.target.value)} placeholder="model-name" /></label>}
+        </div>
+        <button className="primary askButton" disabled={!instruction || mutation.isPending} onClick={() => mutation.mutate()}>
+          <Bot size={16} /> {mutation.isPending ? "Asking Codex..." : "Ask Codex"}
+        </button>
+      </div>
+      {mutation.error && <div className="warning">{mutation.error.message}</div>}
+      {mutation.isPending && (
+        <div className="aiLoading">
+          <div className="pulseDot" />
+          <span>Codex is drafting a proposed edit.</span>
+        </div>
+      )}
+      {proposal && (
+        <div className="proposal">
+          <div className="proposalHeader">
+            <div>
+              <span>Proposal</span>
+              <h3>{proposal.summary}</h3>
+            </div>
+            <span>{proposal.updatedMarkdown.length.toLocaleString()} chars</span>
+          </div>
+          <div className="diff">
+            {diff.map((part, index) => <pre key={index} className={part.added ? "added" : part.removed ? "removed" : ""}>{part.value}</pre>)}
+          </div>
+          <div className="proposalActions">
+            <button className="primary" onClick={() => onApply(proposal.updatedLog)}><Check size={15} /> Apply</button>
+            <button onClick={() => setProposal(null)}><X size={15} /> Reject</button>
+            <button onClick={() => mutation.mutate()}><RefreshCw size={15} /> Regenerate</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function HistoryPanel({ draftId }: { draftId: string }) {
+  const queryClient = useQueryClient();
+  const versions = useQuery({ queryKey: ["versions", draftId], queryFn: () => api<VersionsResponse>(`/api/drafts/${draftId}/versions`) });
+  const restore = useMutation({
+    mutationFn: (id: string) => api<DraftResponse>(`/api/versions/${id}/restore`, { method: "POST" }),
+    onSuccess: () => queryClient.invalidateQueries()
+  });
+  return (
+    <div className="historyPanel">
+      <div className="panelTitle">
+        <div>
+          <h3>Version History</h3>
+          <span>Saved draft snapshots</span>
+        </div>
+      </div>
+      {versions.data?.versions.map((version) => (
+        <article className="historyItem" key={version.id}>
+          <strong>{version.label}</strong>
+          <span>{new Date(version.createdAt).toLocaleString()}</span>
+          <button onClick={() => restore.mutate(version.id)}>Restore</button>
+        </article>
+      ))}
+    </div>
+  );
+}
+
+function SettingsPanel({ settings }: { settings: AppSettings }) {
+  const [local, setLocal] = useState(settings);
+  const [statusActionText, setStatusActionText] = useState("");
+  const hasLoadedSettings = useRef(false);
+  const queryClient = useQueryClient();
+  const status = useQuery({ queryKey: ["codex-status"], queryFn: () => api<any>("/api/codex/status"), ...codexStatusQueryOptions });
+  const codexDefaultModel = status.data?.defaultModel || "CLI configured model";
+  const modelOptions: SelectOption[] = [
+    { value: "gpt-5.4", label: "GPT-5.4", meta: "Recommended for this CLI" },
+    { value: "gpt-5.5", label: "GPT-5.5", meta: "Requires latest Codex" },
+    { value: "default", label: "Use Codex default", meta: `Uses ${displayModelName(codexDefaultModel)}` },
+    { value: "custom", label: "Custom model", meta: "Manual name" }
+  ];
+  const limitModeOptions: SelectOption[] = [
+    { value: "normal", label: "Normal Discord", meta: "2000 characters" },
+    { value: "nitro", label: "Nitro", meta: "4000 characters" },
+    { value: "webhook", label: "Webhook/API", meta: "2000 characters" },
+    { value: "custom", label: "Custom", meta: `${local.customLimit} characters` }
+  ];
+  const save = useMutation({
+    mutationFn: () => api<SettingsResponse>("/api/settings", { method: "PUT", body: JSON.stringify(local) }),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["settings"], data);
+      queryClient.invalidateQueries({ queryKey: ["codex-status"] });
+    }
+  });
+  const updateCodex = useMutation({
+    mutationFn: () => api<{ ok: boolean; output: string }>("/api/codex/update", { method: "POST" }),
+    onSuccess: () => status.refetch()
+  });
+  const statusRefreshing = status.isLoading || status.isFetching;
+  const statusPending = status.isLoading || (status.isFetching && !status.data);
+  const needsCodexUpdate = typeof status.data?.smokeTestError === "string" && status.data.smokeTestError.includes("requires a newer version of Codex");
+  const codexReady = !!status.data?.installed && !!status.data?.loggedIn && !!status.data?.smokeTest;
+  const copySetupCommand = async (command: string) => {
+    await copyText(command);
+    setStatusActionText(`Copied ${command}`);
+    window.setTimeout(() => setStatusActionText(""), 1300);
+  };
+
+  useEffect(() => {
+    setLocal(settings);
+  }, [settings]);
+
+  useEffect(() => {
+    if (!hasLoadedSettings.current) {
+      hasLoadedSettings.current = true;
+      return;
+    }
+    const timeout = window.setTimeout(() => save.mutate(), 650);
+    return () => window.clearTimeout(timeout);
+  }, [local]);
+
+  return (
+    <div className="settingsPanel">
+      <div className="panelTitle">
+        <div>
+          <h3>Settings</h3>
+          <span>Codex, splitting, and autosave</span>
+        </div>
+      </div>
+      <h3>Codex Setup</h3>
+      <StatusRow
+        pending={statusPending}
+        label="Installed"
+        ok={!!status.data?.installed}
+        detail={status.data?.version || "npm i -g @openai/codex"}
+        actionLabel="Copy install"
+        onAction={() => copySetupCommand("npm i -g @openai/codex")}
+      />
+      <StatusRow
+        pending={statusPending}
+        label="Logged in"
+        ok={!!status.data?.loggedIn}
+        detail={status.data?.loginStatus || "codex login"}
+        actionLabel="Copy login"
+        onAction={() => copySetupCommand("codex login")}
+      />
+      <StatusRow
+        pending={statusPending}
+        label="Exec ready"
+        ok={!!status.data?.smokeTest}
+        detail={status.data?.smokeTestError || "read-only JSON exec"}
+        actionLabel="Refresh"
+        onAction={() => status.refetch()}
+      />
+      <div className="settingsActions">
+        <button className={statusRefreshing ? "refreshButton loading" : "refreshButton"} disabled={statusRefreshing} onClick={() => status.refetch()}>
+          <RefreshCw size={15} /> {statusRefreshing ? "Refreshing..." : "Refresh status"}
+        </button>
+        {statusPending ? (
+          <button className="upToDateButton" disabled>
+            <RefreshCw className="spinIcon" size={15} /> Checking Codex...
+          </button>
+        ) : codexReady ? (
+          <button className="upToDateButton" disabled>
+            <Check size={15} /> Codex CLI up to date
+          </button>
+        ) : (
+          <button
+            className="primary"
+            disabled={updateCodex.isPending || !needsCodexUpdate}
+            onClick={() => updateCodex.mutate()}
+          >
+            <RefreshCw size={15} /> {updateCodex.isPending ? "Updating Codex..." : needsCodexUpdate ? "Update Codex CLI" : "Codex update unavailable"}
+          </button>
+        )}
+      </div>
+      {statusActionText && <div className="settingsSaveHint">{statusActionText}</div>}
+      {updateCodex.error && <div className="warning">{updateCodex.error.message}</div>}
+      {updateCodex.data?.ok && <div className="success">Codex CLI update finished.</div>}
+      <h3>Defaults</h3>
+      <CustomSelect
+        label="Codex model"
+        value={local.selectedModelMode}
+        options={modelOptions}
+        onChange={(value) => setLocal({ ...local, selectedModelMode: value as AppSettings["selectedModelMode"] })}
+      />
+      {local.selectedModelMode === "custom" && <label>Custom model<input value={local.customModel} onChange={(event) => setLocal({ ...local, customModel: event.target.value })} /></label>}
+      <CustomSelect
+        label="Character limit mode"
+        value={local.characterLimitMode}
+        options={limitModeOptions}
+        onChange={(value) => setLocal({ ...local, characterLimitMode: value as AppSettings["characterLimitMode"] })}
+      />
+      <label>Custom limit<input type="number" value={local.customLimit} onChange={(event) => setLocal({ ...local, customLimit: Number(event.target.value) })} /></label>
+      <label className="settingToggle">
+        <input
+          type="checkbox"
+          checked={hasEveryoneFooter(local.defaultFooter)}
+          onChange={(event) => setLocal({ ...local, defaultFooter: setEveryoneFooter(local.defaultFooter, event.target.checked) })}
+        />
+        <span className="toggleBox"><Check size={18} /></span>
+        <span>
+          <strong>Default everyone footer</strong>
+          <small>New drafts include <code>{everyoneFooter}</code> automatically when this is enabled.</small>
+        </span>
+      </label>
+      <label>Autosave ms<input type="number" value={local.autosaveIntervalMs} onChange={(event) => setLocal({ ...local, autosaveIntervalMs: Number(event.target.value) })} /></label>
+      <button className="primary" onClick={() => save.mutate()}><Save size={15} /> {save.isPending ? "Saving..." : "Save settings"}</button>
+      <div className="settingsSaveHint">{save.isPending ? "Auto-saving settings..." : "Settings auto-save after changes."}</div>
+    </div>
+  );
+}
+
+function StatusRow({
+  label,
+  ok,
+  detail,
+  pending = false,
+  actionLabel,
+  onAction
+}: {
+  label: string;
+  ok: boolean;
+  detail: string;
+  pending?: boolean;
+  actionLabel?: string;
+  onAction?: () => void;
+}) {
+  const needsAction = !pending && !ok && actionLabel && onAction;
+  return (
+    <div className={pending ? "status pending" : ok ? "status ok" : "status bad"}>
+      <span>{pending ? "Checking" : ok ? "OK" : "Needs setup"}</span>
+      <strong>{label}</strong>
+      <code>{pending ? "Checking status..." : detail}</code>
+      {needsAction ? <button className="statusAction" onClick={onAction}>{actionLabel}</button> : <span className="statusActionSpacer" />}
+    </div>
+  );
+}
+
+const rootElement = document.getElementById("root")!;
+const hotWindow = window as typeof window & { __updateLogEditorRoot?: ReturnType<typeof createRoot> };
+hotWindow.__updateLogEditorRoot ??= createRoot(rootElement);
+hotWindow.__updateLogEditorRoot.render(
+  <React.StrictMode>
+    <QueryClientProvider client={queryClient}>
+      <App />
+    </QueryClientProvider>
+  </React.StrictMode>
+);

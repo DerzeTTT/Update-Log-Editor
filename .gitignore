@@ -9,6 +9,12 @@
 .idea/
 *.tmp
 *.log
+node_modules/
+dist/
+data/
+.vite/
+coverage/
+screenshots/chrome-*/
 
 # OS files
 .DS_Store

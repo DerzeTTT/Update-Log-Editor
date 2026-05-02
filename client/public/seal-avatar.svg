@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96" role="img" aria-label="Seal avatar">
+  <defs>
+    <radialGradient id="water" cx="34%" cy="24%" r="82%">
+      <stop offset="0%" stop-color="#6fd4ff"/>
+      <stop offset="52%" stop-color="#3c7cff"/>
+      <stop offset="100%" stop-color="#172238"/>
+    </radialGradient>
+    <linearGradient id="fur" x1="20%" y1="12%" x2="80%" y2="88%">
+      <stop offset="0%" stop-color="#f4fbff"/>
+      <stop offset="48%" stop-color="#cdd9e7"/>
+      <stop offset="100%" stop-color="#7e90a6"/>
+    </linearGradient>
+    <linearGradient id="shadow" x1="42%" y1="28%" x2="72%" y2="96%">
+      <stop offset="0%" stop-color="#9daec2" stop-opacity="0"/>
+      <stop offset="100%" stop-color="#3c495d" stop-opacity=".48"/>
+    </linearGradient>
+  </defs>
+  <rect width="96" height="96" rx="48" fill="url(#water)"/>
+  <path d="M13 68c10 8 23 12 38 12 12 0 23-3 32-8v16H13z" fill="#dff7ff" opacity=".24"/>
+  <path d="M27 41c0-16 12-28 27-28 14 0 25 10 25 24 0 9-4 16-12 22 2 2 4 6 4 10 0 8-8 14-19 14-17 0-30-14-30-28 0-5 2-10 5-14z" fill="url(#fur)"/>
+  <path d="M38 37c4-4 10-6 17-6 12 0 21 8 21 19 0 3-.7 6-2 9 3-4 5-10 5-17 0-14-11-24-25-24-15 0-27 12-27 28v1c3-4 6-7 11-10z" fill="#ffffff" opacity=".45"/>
+  <path d="M34 55c7 12 18 19 34 19-3 5-9 9-16 9-17 0-30-14-30-28 0-5 2-10 5-14 1 5 3 10 7 14z" fill="url(#shadow)"/>
+  <circle cx="49" cy="43" r="3.8" fill="#172033"/>
+  <circle cx="68" cy="43" r="3.8" fill="#172033"/>
+  <circle cx="50.5" cy="41.5" r="1.2" fill="#fff"/>
+  <circle cx="69.5" cy="41.5" r="1.2" fill="#fff"/>
+  <path d="M58 50c2 0 4 1.4 4 3.1 0 1.8-1.8 3.2-4 3.2s-4-1.4-4-3.2c0-1.7 1.8-3.1 4-3.1z" fill="#2c3342"/>
+  <path d="M57.7 56c-2.4 4-6.6 5.4-11.4 3.8M58.3 56c2.4 4 6.6 5.4 11.4 3.8" fill="none" stroke="#586579" stroke-width="2.3" stroke-linecap="round"/>
+  <path d="M39 54l-15-4M39 59l-17 1M39 64l-14 5M77 54l15-4M77 59l17 1M77 64l14 5" fill="none" stroke="#eef7ff" stroke-width="2.2" stroke-linecap="round" opacity=".85"/>
+  <path d="M8 14c9 6 19 5 30-2" fill="none" stroke="#ffffff" stroke-width="5" stroke-linecap="round" opacity=".20"/>
+</svg>

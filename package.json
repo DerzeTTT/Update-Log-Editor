@@ -1,0 +1,50 @@
+{
+  "name": "update-log-editor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/start.mjs",
+    "start:headless": "node scripts/start.mjs --no-open",
+    "dev:server": "tsx watch server/index.ts",
+    "dev:client": "vite --host 127.0.0.1",
+    "api": "node scripts/api.mjs",
+    "server": "tsx server/index.ts",
+    "build": "tsc --noEmit && vite build",
+    "test": "vitest run",
+    "update-log:add": "node scripts/codex-intake.mjs",
+    "update-log:daily": "node scripts/codex-daily.mjs",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@monaco-editor/react": "^4.7.0",
+    "@tanstack/react-query": "^5.90.10",
+    "@vitejs/plugin-react": "^5.1.1",
+    "better-sqlite3": "^12.9.0",
+    "diff": "^8.0.2",
+    "express": "^5.1.0",
+    "lucide-react": "^0.552.0",
+    "nanoid": "^5.1.6",
+    "open": "^10.2.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1",
+    "zod": "^4.1.12"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.0",
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/diff": "^7.0.2",
+    "@types/express": "^5.0.5",
+    "@types/node": "^24.10.1",
+    "@types/react": "^19.2.2",
+    "@types/react-dom": "^19.2.2",
+    "jsdom": "^27.2.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "vite": "^7.2.4",
+    "vitest": "^4.0.13"
+  }
+}
