@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { nanoid } from "nanoid";
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseUpdateLog, serializeUpdateLog } from "../shared/markdown";
@@ -10,8 +10,11 @@ import { settingsSchema, type AppSettings, type CodexIntakeEntry, type DraftReco
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const dataDir = join(rootDir, "data");
 const dbPath = join(dataDir, "update-log-editor.sqlite");
+const draftsDir = join(rootDir, "Drafts");
+const legacyDraftsDir = join(dataDir, "drafts");
 
 mkdirSync(dataDir, { recursive: true });
+mkdirSync(draftsDir, { recursive: true });
 
 export const db = new Database(dbPath);
 db.pragma("journal_mode = WAL");
@@ -19,6 +22,63 @@ db.pragma("foreign_keys = ON");
 
 export function nowIso(): string {
   return new Date().toISOString();
+}
+
+export function getDraftMarkdownPath(id: string): string {
+  return join(draftsDir, `${id}.md`);
+}
+
+function getLegacyDraftMarkdownPath(id: string): string {
+  return join(legacyDraftsDir, `${id}.md`);
+}
+
+function writeDraftMarkdownFile(id: string, rawMarkdown: string) {
+  const filePath = getDraftMarkdownPath(id);
+  mkdirSync(dirname(filePath), { recursive: true });
+  if (existsSync(filePath) && readFileSync(filePath, "utf8") === rawMarkdown) return;
+  writeFileSync(filePath, rawMarkdown, "utf8");
+}
+
+function updateDraftRecord(id: string, rawMarkdown: string, structured: UpdateLog, name: string, writeFile: boolean): DraftRecord | undefined {
+  db.prepare(`
+    UPDATE drafts
+    SET name = ?, raw_markdown = ?, structured_json = ?, updated_at = ?
+    WHERE id = ?
+  `).run(name, rawMarkdown, JSON.stringify(structured), nowIso(), id);
+  if (writeFile) writeDraftMarkdownFile(id, rawMarkdown);
+  return getDraft(id, { skipFileSync: true });
+}
+
+function syncDraftFromMarkdownFile(id: string): DraftRecord | undefined {
+  const row = db.prepare("SELECT * FROM drafts WHERE id = ?").get(id) as any | undefined;
+  if (!row) return undefined;
+  const filePath = getDraftMarkdownPath(id);
+  const legacyFilePath = getLegacyDraftMarkdownPath(id);
+  if (!existsSync(filePath) && existsSync(legacyFilePath)) {
+    writeFileSync(filePath, readFileSync(legacyFilePath, "utf8"), "utf8");
+  }
+  if (!existsSync(filePath)) {
+    writeDraftMarkdownFile(id, row.raw_markdown);
+    return mapDraft(row);
+  }
+
+  const fileStat = statSync(filePath);
+  const dbUpdatedMs = Date.parse(row.updated_at);
+  if (Number.isFinite(dbUpdatedMs) && fileStat.mtimeMs <= dbUpdatedMs + 500) {
+    return mapDraft(row);
+  }
+
+  const rawMarkdown = readFileSync(filePath, "utf8");
+  if (rawMarkdown === row.raw_markdown) return mapDraft(row);
+  const structured = parseUpdateLog(rawMarkdown).log;
+  const draft = updateDraftRecord(id, rawMarkdown, structured, row.name, false);
+  if (draft) createVersion(id, rawMarkdown, structured, "File sync");
+  return draft;
+}
+
+function syncAllDraftFiles() {
+  const rows = db.prepare("SELECT id FROM drafts").all() as Array<{ id: string }>;
+  for (const row of rows) syncDraftFromMarkdownFile(row.id);
 }
 
 export function initDb() {
@@ -88,6 +148,8 @@ export function initDb() {
     `).run(nanoid(), id, sampleMarkdown, JSON.stringify(parsed), "Seed version", timestamp);
   }
 
+  syncAllDraftFiles();
+
   const settings = getSettings();
   saveSettings(settings);
 }
@@ -98,6 +160,7 @@ function mapDraft(row: any): DraftRecord {
     name: row.name,
     rawMarkdown: row.raw_markdown,
     structured: JSON.parse(row.structured_json),
+    filePath: getDraftMarkdownPath(row.id),
     createdAt: row.created_at,
     updatedAt: row.updated_at
   };
@@ -128,10 +191,12 @@ function mapCodexIntake(row: any): CodexIntakeEntry {
 }
 
 export function listDrafts(): DraftRecord[] {
+  syncAllDraftFiles();
   return (db.prepare("SELECT * FROM drafts ORDER BY updated_at DESC").all() as any[]).map(mapDraft);
 }
 
-export function getDraft(id: string): DraftRecord | undefined {
+export function getDraft(id: string, options: { skipFileSync?: boolean } = {}): DraftRecord | undefined {
+  if (!options.skipFileSync) return syncDraftFromMarkdownFile(id);
   const row = db.prepare("SELECT * FROM drafts WHERE id = ?").get(id);
   return row ? mapDraft(row) : undefined;
 }
@@ -144,19 +209,15 @@ export function createDraft(name: string, rawMarkdown: string, structured?: Upda
     INSERT INTO drafts (id, name, raw_markdown, structured_json, created_at, updated_at)
     VALUES (?, ?, ?, ?, ?, ?)
   `).run(id, name, rawMarkdown, JSON.stringify(parsed), timestamp, timestamp);
+  writeDraftMarkdownFile(id, rawMarkdown);
   createVersion(id, rawMarkdown, parsed, "Created");
-  return getDraft(id)!;
+  return getDraft(id, { skipFileSync: true })!;
 }
 
 export function updateDraft(id: string, rawMarkdown: string, structured: UpdateLog, name?: string): DraftRecord | undefined {
   const existing = getDraft(id);
   if (!existing) return undefined;
-  db.prepare(`
-    UPDATE drafts
-    SET name = ?, raw_markdown = ?, structured_json = ?, updated_at = ?
-    WHERE id = ?
-  `).run(name ?? existing.name, rawMarkdown, JSON.stringify(structured), nowIso(), id);
-  return getDraft(id);
+  return updateDraftRecord(id, rawMarkdown, structured, name ?? existing.name, true);
 }
 
 export function duplicateDraft(id: string): DraftRecord | undefined {
@@ -167,6 +228,8 @@ export function duplicateDraft(id: string): DraftRecord | undefined {
 
 export function deleteDraft(id: string): boolean {
   const result = db.prepare("DELETE FROM drafts WHERE id = ?").run(id);
+  const filePath = getDraftMarkdownPath(id);
+  if (result.changes > 0 && existsSync(filePath)) unlinkSync(filePath);
   return result.changes > 0;
 }
 
@@ -192,6 +255,10 @@ export function restoreVersion(versionId: string): DraftRecord | undefined {
   const version = getVersion(versionId);
   if (!version) return undefined;
   return updateDraft(version.draftId, version.rawMarkdown, version.structured);
+}
+
+export function importDraftMarkdownFile(id: string): DraftRecord | undefined {
+  return syncDraftFromMarkdownFile(id);
 }
 
 export function getSettings(): AppSettings {

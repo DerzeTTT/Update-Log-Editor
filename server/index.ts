@@ -7,7 +7,9 @@ import {
   deleteDraft,
   duplicateDraft,
   getDraft,
+  getDraftMarkdownPath,
   getSettings,
+  importDraftMarkdownFile,
   initDb,
   listAiHistory,
   listCodexIntakeForDay,
@@ -48,6 +50,18 @@ app.post("/api/drafts", (req, res) => {
 
 app.get("/api/drafts/:id", (req, res) => {
   const draft = getDraft(req.params.id);
+  if (!draft) return res.status(404).json({ error: "Draft not found." });
+  res.json({ draft });
+});
+
+app.get("/api/drafts/:id/file", (req, res) => {
+  const draft = getDraft(req.params.id);
+  if (!draft) return res.status(404).json({ error: "Draft not found." });
+  res.json({ filePath: getDraftMarkdownPath(draft.id), draft });
+});
+
+app.post("/api/drafts/:id/import-file", (req, res) => {
+  const draft = importDraftMarkdownFile(req.params.id);
   if (!draft) return res.status(404).json({ error: "Draft not found." });
   res.json({ draft });
 });

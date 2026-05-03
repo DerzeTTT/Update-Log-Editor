@@ -12,6 +12,7 @@
 node_modules/
 dist/
 data/
+Drafts/
 .vite/
 coverage/
 screenshots/chrome-*/

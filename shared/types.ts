@@ -45,6 +45,7 @@ export type DraftRecord = {
   name: string;
   rawMarkdown: string;
   structured: UpdateLog;
+  filePath: string;
   createdAt: string;
   updatedAt: string;
 };

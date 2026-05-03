@@ -14,6 +14,7 @@
     "test": "vitest run",
     "update-log:add": "node scripts/codex-intake.mjs",
     "update-log:daily": "node scripts/codex-daily.mjs",
+    "update-log:auto": "node scripts/update-log-automation.mjs",
     "test:watch": "vitest"
   },
   "dependencies": {

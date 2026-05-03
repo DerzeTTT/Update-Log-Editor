@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { createRoot } from "react-dom/client";
 import Editor from "@monaco-editor/react";
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -13,8 +13,11 @@ import {
   Copy,
   Download,
   FilePlus,
+  FileText,
   History,
+  Eye,
   ListPlus,
+  MessagesSquare,
   Moon,
   Plus,
   RefreshCw,
@@ -57,6 +60,64 @@ const codexStatusQueryOptions = {
 };
 
 const queryClient = new QueryClient();
+
+function createAmbientGlow(id: number): AmbientGlow {
+  const colors = [
+    "rgba(76,131,255,0.42)",
+    "rgba(36,161,222,0.34)",
+    "rgba(255,104,117,0.24)",
+    "rgba(155,115,255,0.30)"
+  ];
+  return {
+    id,
+    color: colors[Math.floor(Math.random() * colors.length)],
+    size: `${440 + Math.round(Math.random() * 360)}px`,
+    x: `${Math.round(-10 + Math.random() * 105)}vw`,
+    y: `${Math.round(-12 + Math.random() * 98)}vh`,
+    dx: `${Math.round(-22 + Math.random() * 44)}vw`,
+    dy: `${Math.round(-18 + Math.random() * 36)}vh`,
+    duration: `${15000 + Math.round(Math.random() * 8000)}ms`
+  };
+}
+
+const AmbientGlows = React.memo(function AmbientGlows() {
+  const [ambientGlows, setAmbientGlows] = useState<AmbientGlow[]>([]);
+
+  useEffect(() => {
+    let nextId = 1;
+    const spawn = () => {
+      const glow = createAmbientGlow(nextId++);
+      setAmbientGlows((current) => [...current.slice(-3), glow]);
+      window.setTimeout(() => {
+        setAmbientGlows((current) => current.filter((entry) => entry.id !== glow.id));
+      }, Number.parseInt(glow.duration, 10) + 900);
+    };
+    spawn();
+    const interval = window.setInterval(spawn, 4300);
+    return () => window.clearInterval(interval);
+  }, []);
+
+  return (
+    <div className="ambientGlows" aria-hidden="true">
+      {ambientGlows.map((glow) => (
+        <span
+          key={glow.id}
+          className="ambientGlow"
+          style={{
+            "--glow-color": glow.color,
+            "--glow-size": glow.size,
+            "--glow-x": glow.x,
+            "--glow-y": glow.y,
+            "--glow-dx": glow.dx,
+            "--glow-dy": glow.dy,
+            "--glow-duration": glow.duration
+          } as React.CSSProperties}
+        />
+      ))}
+    </div>
+  );
+});
+
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...options,
@@ -147,7 +208,7 @@ function renderStructuredInlineMarkdown(value: string) {
   return parts;
 }
 
-function MarkdownTextInput({
+const MarkdownTextInput = React.memo(function MarkdownTextInput({
   value,
   onChange,
   placeholder,
@@ -158,18 +219,139 @@ function MarkdownTextInput({
   placeholder?: string;
   className?: string;
 }) {
+  const [localValue, setLocalValue] = useState(value);
+  const commitTimeoutRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    setLocalValue(value);
+  }, [value]);
+
+  useEffect(() => () => {
+    if (commitTimeoutRef.current !== null) {
+      window.clearTimeout(commitTimeoutRef.current);
+    }
+  }, []);
+
+  const commit = (next: string) => {
+    if (commitTimeoutRef.current !== null) {
+      window.clearTimeout(commitTimeoutRef.current);
+      commitTimeoutRef.current = null;
+    }
+    onChange(next);
+  };
+
+  const scheduleCommit = (next: string) => {
+    if (commitTimeoutRef.current !== null) {
+      window.clearTimeout(commitTimeoutRef.current);
+    }
+    commitTimeoutRef.current = window.setTimeout(() => commit(next), 220);
+  };
+
   return (
     <span className={`markdownTextInput ${className ?? ""}`}>
       <span className="markdownTextPreview" aria-hidden="true">
-        {renderStructuredInlineMarkdown(value)}
+        {renderStructuredInlineMarkdown(localValue)}
       </span>
       <input
         className="markdownTextControl"
-        value={value}
+        value={localValue}
         placeholder={placeholder}
-        onChange={(event) => onChange(event.target.value)}
+        onChange={(event) => {
+          setLocalValue(event.target.value);
+          scheduleCommit(event.target.value);
+        }}
+        onBlur={(event) => commit(event.target.value)}
       />
     </span>
+  );
+}, (previous, next) =>
+  previous.value === next.value &&
+  previous.placeholder === next.placeholder &&
+  previous.className === next.className
+);
+
+type MonacoEditorLike = {
+  getValue: () => string;
+  setValue: (value: string) => void;
+  getSelection: () => unknown;
+  setSelection: (selection: any) => void;
+  getScrollTop: () => number;
+  setScrollTop: (value: number) => void;
+  getScrollLeft: () => number;
+  setScrollLeft: (value: number) => void;
+};
+
+function RawMarkdownEditor({
+  value,
+  syncVersion,
+  onChange
+}: {
+  value: string;
+  syncVersion: number;
+  onChange: (value: string) => void;
+}) {
+  const editorRef = useRef<MonacoEditorLike | null>(null);
+  const latestValueRef = useRef(value);
+  const applyingExternalValueRef = useRef(false);
+  latestValueRef.current = value;
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor || editor.getValue() === value) return;
+
+    const selection = editor.getSelection();
+    const scrollTop = editor.getScrollTop();
+    const scrollLeft = editor.getScrollLeft();
+
+    try {
+      applyingExternalValueRef.current = true;
+      editor.setValue(value);
+      if (selection) editor.setSelection(selection);
+      editor.setScrollTop(scrollTop);
+      editor.setScrollLeft(scrollLeft);
+    } finally {
+      applyingExternalValueRef.current = false;
+    }
+  }, [syncVersion]);
+
+  return (
+    <Editor
+      height="100%"
+      defaultLanguage="markdown"
+      defaultValue={value}
+      theme="vs-dark"
+      options={{
+        minimap: { enabled: false },
+        wordWrap: "on",
+        fontSize: 14,
+        lineHeight: 22,
+        tabSize: 2,
+        automaticLayout: true,
+        padding: { top: 10, bottom: 18 },
+        unicodeHighlight: {
+          ambiguousCharacters: false,
+          invisibleCharacters: false,
+          nonBasicASCII: false
+        }
+      }}
+      onMount={(editor) => {
+        editorRef.current = editor as MonacoEditorLike;
+        const latestValue = latestValueRef.current;
+        if (editor.getValue() !== latestValue) {
+          try {
+            applyingExternalValueRef.current = true;
+            editor.setValue(latestValue);
+          } finally {
+            applyingExternalValueRef.current = false;
+          }
+        }
+      }}
+      onChange={(nextValue) => {
+        if (!applyingExternalValueRef.current) {
+          onChange(nextValue ?? "");
+        }
+      }}
+    />
   );
 }
 
@@ -185,46 +367,16 @@ function App() {
   const [draftName, setDraftName] = useState("");
   const [copyToast, setCopyToast] = useState("");
   const [confirmDeleteDraftId, setConfirmDeleteDraftId] = useState<string | null>(null);
-  const [ambientGlows, setAmbientGlows] = useState<AmbientGlow[]>([]);
   const [lastManualSaveAt, setLastManualSaveAt] = useState<string>("");
+  const [rawEditorSyncVersion, setRawEditorSyncVersion] = useState(0);
+  const hydratedDraftIdRef = useRef("");
   const queryClient = useQueryClient();
-
-  const createAmbientGlow = (id: number): AmbientGlow => {
-    const colors = [
-      "rgba(76,131,255,0.42)",
-      "rgba(36,161,222,0.34)",
-      "rgba(255,104,117,0.24)",
-      "rgba(155,115,255,0.30)"
-    ];
-    return {
-      id,
-      color: colors[Math.floor(Math.random() * colors.length)],
-      size: `${440 + Math.round(Math.random() * 360)}px`,
-      x: `${Math.round(-10 + Math.random() * 105)}vw`,
-      y: `${Math.round(-12 + Math.random() * 98)}vh`,
-      dx: `${Math.round(-22 + Math.random() * 44)}vw`,
-      dy: `${Math.round(-18 + Math.random() * 36)}vh`,
-      duration: `${15000 + Math.round(Math.random() * 8000)}ms`
-    };
-  };
-
-  useEffect(() => {
-    let nextId = 1;
-    const spawn = () => {
-      const glow = createAmbientGlow(nextId++);
-      setAmbientGlows((current) => [...current.slice(-3), glow]);
-      window.setTimeout(() => {
-        setAmbientGlows((current) => current.filter((entry) => entry.id !== glow.id));
-      }, Number.parseInt(glow.duration, 10) + 900);
-    };
-    spawn();
-    const interval = window.setInterval(spawn, 4300);
-    return () => window.clearInterval(interval);
-  }, []);
 
   const draftsQuery = useQuery({
     queryKey: ["drafts"],
-    queryFn: () => api<DraftsResponse>("/api/drafts")
+    queryFn: () => api<DraftsResponse>("/api/drafts"),
+    refetchInterval: 4000,
+    refetchIntervalInBackground: true
   });
   const settingsQuery = useQuery({
     queryKey: ["settings"],
@@ -238,12 +390,16 @@ function App() {
   });
   const activeDraft = draftsQuery.data?.drafts.find((draft) => draft.id === selectedDraftId) ?? draftsQuery.data?.drafts[0];
   const draftToDelete = draftsQuery.data?.drafts.find((draft) => draft.id === confirmDeleteDraftId);
+  const deferredRawMarkdown = useDeferredValue(rawMarkdown);
+  const deferredStructured = useDeferredValue(structured);
 
   const hydrateDraft = (draft: DraftRecord) => {
+    hydratedDraftIdRef.current = draft.id;
     setRawMarkdown(draft.rawMarkdown);
     setStructured(draft.structured);
     setDraftName(draft.name);
     setDiagnostics(parseUpdateLog(draft.rawMarkdown).diagnostics);
+    setRawEditorSyncVersion((version) => version + 1);
   };
 
   const selectDraft = (draft: DraftRecord) => {
@@ -278,6 +434,7 @@ function App() {
 
   useEffect(() => {
     if (!activeDraft) return;
+    if (activeDraft.id === hydratedDraftIdRef.current) return;
     hydrateDraft(activeDraft);
   }, [activeDraft?.id]);
 
@@ -310,10 +467,7 @@ function App() {
         if (!previous) return { drafts: [data.draft] };
         return { drafts: [data.draft, ...previous.drafts.filter((draft) => draft.id !== data.draft.id)] };
       });
-      setDraftName(data.draft.name);
-      setRawMarkdown(data.draft.rawMarkdown);
-      setStructured(data.draft.structured);
-      setDiagnostics(parseUpdateLog(data.draft.rawMarkdown).diagnostics);
+      hydrateDraft(data.draft);
       queryClient.invalidateQueries({ queryKey: ["drafts"] });
       setSelectedDraftId(data.draft.id);
     }
@@ -388,18 +542,19 @@ function App() {
     setStructured(next);
     setRawMarkdown(serializeUpdateLog(next));
     setDiagnostics([]);
+    setRawEditorSyncVersion((version) => version + 1);
   }, []);
 
   const splitResult = useMemo(() => {
     const settings = settingsQuery.data?.settings;
-    return splitDiscordMessages(rawMarkdown, {
+    return splitDiscordMessages(deferredRawMarkdown, {
       mode: settings?.characterLimitMode ?? "normal",
       customLimit: settings?.customLimit,
       continuationHeaders: settings?.continuationHeaders,
-      title: structured.title,
-      footer: structured.footer
+      title: deferredStructured.title,
+      footer: deferredStructured.footer
     });
-  }, [rawMarkdown, settingsQuery.data, structured.title, structured.footer]);
+  }, [deferredRawMarkdown, settingsQuery.data, deferredStructured.title, deferredStructured.footer]);
 
   const toastCopy = async (text: string, label: string) => {
     await copyText(text);
@@ -409,23 +564,7 @@ function App() {
 
   return (
     <div className="app">
-      <div className="ambientGlows" aria-hidden="true">
-        {ambientGlows.map((glow) => (
-          <span
-            key={glow.id}
-            className="ambientGlow"
-            style={{
-              "--glow-color": glow.color,
-              "--glow-size": glow.size,
-              "--glow-x": glow.x,
-              "--glow-y": glow.y,
-              "--glow-dx": glow.dx,
-              "--glow-dy": glow.dy,
-              "--glow-duration": glow.duration
-            } as React.CSSProperties}
-          />
-        ))}
-      </div>
+      <AmbientGlows />
       <aside className="sidebar">
         <div className="brand">
           <Moon size={20} />
@@ -463,6 +602,11 @@ function App() {
           <input value={draftName} onChange={(event) => setDraftName(event.target.value)} className="titleInput" />
           <div className="actions">
             {copyToast && <span className="toast">{copyToast}</span>}
+            {activeDraft?.filePath && (
+              <button title="Copy Markdown file path" onClick={() => toastCopy(activeDraft.filePath, ".md path copied")}>
+                <FileText size={16} /> Copy .md path
+              </button>
+            )}
             <button disabled={!selectedDraftId || saveVersion.isPending} title="Save version" onClick={() => saveVersion.mutate()}>
               <Save size={16} /> {saveVersion.isPending ? "Saving..." : "Save"}
             </button>
@@ -487,27 +631,7 @@ function App() {
               </button>
             </div>
             <div className={`editorMode ${tab === "raw" ? `active ${editorSlideDirection}` : "inactive"} monacoShell`} aria-hidden={tab !== "raw"}>
-                <Editor
-                  height="100%"
-                  defaultLanguage="markdown"
-                  theme="vs-dark"
-                  value={rawMarkdown}
-                  options={{
-                    minimap: { enabled: false },
-                    wordWrap: "on",
-                    fontSize: 14,
-                    lineHeight: 22,
-                    tabSize: 2,
-                    automaticLayout: true,
-                    padding: { top: 10, bottom: 18 },
-                    unicodeHighlight: {
-                      ambiguousCharacters: false,
-                      invisibleCharacters: false,
-                      nonBasicASCII: false
-                    }
-                  }}
-                  onChange={(value) => updateFromRaw(value ?? "")}
-                />
+                <RawMarkdownEditor value={rawMarkdown} syncVersion={rawEditorSyncVersion} onChange={updateFromRaw} />
               </div>
               <div className={`editorMode ${tab === "structured" ? `active ${editorSlideDirection}` : "inactive"} structuredShell`} aria-hidden={tab !== "structured"}>
                 <StructuredEditor
@@ -527,21 +651,21 @@ function App() {
 
           <div className="sidePane">
             <div className="tabs">
-              <button className={sideTab === "preview" ? "active" : ""} onClick={() => switchSideTab("preview")}>Preview</button>
-              <button className={sideTab === "split" ? "active" : ""} onClick={() => switchSideTab("split")}>Messages</button>
+              <button className={sideTab === "preview" ? "active" : ""} onClick={() => switchSideTab("preview")}><Eye size={14} /> Preview</button>
+              <button className={sideTab === "split" ? "active" : ""} onClick={() => switchSideTab("split")}><MessagesSquare size={14} /> Messages</button>
               <button className={sideTab === "ai" ? "active" : ""} onClick={() => switchSideTab("ai")}><Bot size={14} /> AI</button>
               <button className={sideTab === "history" ? "active" : ""} onClick={() => switchSideTab("history")}><History size={14} /> History</button>
               <button className={sideTab === "settings" ? "active" : ""} onClick={() => switchSideTab("settings")}><Settings size={14} /> Settings</button>
             </div>
             <div className="sideContent">
               <div className={`sideMode ${sideTab === "preview" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "preview"}>
-                <Preview rawMarkdown={rawMarkdown} />
+                <Preview rawMarkdown={deferredRawMarkdown} />
               </div>
               <div className={`sideMode ${sideTab === "split" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "split"}>
                 <SplitPanel
                   result={splitResult}
                   onCopy={toastCopy}
-                  rawMarkdown={rawMarkdown}
+                  rawMarkdown={deferredRawMarkdown}
                   settings={settingsQuery.data?.settings}
                   onTogglePartHeaders={(enabled) => {
                     const current = settingsQuery.data?.settings;
@@ -687,19 +811,111 @@ const StructuredEditor = React.memo(function StructuredEditor({
   lastSavedAt: string;
 }) {
   const [activeSectionIndex, setActiveSectionIndex] = useState(0);
+  const [localLog, setLocalLog] = useState(log);
+  const [, startTransition] = useTransition();
   const structuredRef = useRef<HTMLDivElement>(null);
   const collapsedSectionsRef = useRef<Set<number>>(new Set());
-  const sectionOptions = log.sections.map((section, index) => ({
+  const localLogRef = useRef(log);
+  const lastPropagatedLogRef = useRef<UpdateLog | null>(null);
+  const commitTimeoutRef = useRef<number | null>(null);
+  localLogRef.current = localLog;
+
+  useEffect(() => {
+    if (log === lastPropagatedLogRef.current) return;
+    localLogRef.current = log;
+    setLocalLog(log);
+  }, [log]);
+
+  useEffect(() => () => {
+    if (commitTimeoutRef.current !== null) {
+      window.clearTimeout(commitTimeoutRef.current);
+    }
+  }, []);
+
+  const commitLog = (next: UpdateLog, immediate = false) => {
+    if (commitTimeoutRef.current !== null) {
+      window.clearTimeout(commitTimeoutRef.current);
+      commitTimeoutRef.current = null;
+    }
+    const propagate = () => {
+      lastPropagatedLogRef.current = next;
+      startTransition(() => onChange(next));
+    };
+    if (immediate) {
+      propagate();
+    } else {
+      commitTimeoutRef.current = window.setTimeout(propagate, 1500);
+    }
+  };
+
+  const sectionOptions = localLog.sections.map((section, index) => ({
     value: String(index),
     label: section.title || `Section ${index + 1}`,
     meta: `${section.items.length} bullet${section.items.length === 1 ? "" : "s"}`
   }));
-  const clampedActiveSectionIndex = Math.min(activeSectionIndex, Math.max(0, log.sections.length - 1));
+  const clampedActiveSectionIndex = Math.min(activeSectionIndex, Math.max(0, localLog.sections.length - 1));
 
-  const setLog = (mutator: (draft: UpdateLog) => void) => {
-    const next = cloneLog(log);
+  const setLog = (mutator: (draft: UpdateLog) => void, immediate = false) => {
+    const next = cloneLog(localLogRef.current);
     mutator(next);
-    onChange(next);
+    applyLocalLog(next, immediate);
+  };
+
+  const applyLocalLog = (next: UpdateLog, immediate = false) => {
+    localLogRef.current = next;
+    setLocalLog(next);
+    commitLog(next, immediate);
+  };
+
+  const updateTitle = (value: string) => {
+    applyLocalLog({ ...localLogRef.current, title: value });
+  };
+
+  const updateSectionTitle = (sectionIndex: number, value: string) => {
+    const current = localLogRef.current;
+    const sections = [...current.sections];
+    sections[sectionIndex] = { ...sections[sectionIndex], title: value };
+    applyLocalLog({ ...current, sections });
+  };
+
+  const updateItemText = (sectionIndex: number, itemIndex: number, value: string) => {
+    const current = localLogRef.current;
+    const sections = [...current.sections];
+    const section = sections[sectionIndex];
+    const items = [...section.items];
+    items[itemIndex] = { ...items[itemIndex], text: value };
+    sections[sectionIndex] = { ...section, items };
+    applyLocalLog({ ...current, sections });
+  };
+
+  const updateChildText = (sectionIndex: number, itemIndex: number, childIndex: number, value: string) => {
+    const current = localLogRef.current;
+    const sections = [...current.sections];
+    const section = sections[sectionIndex];
+    const items = [...section.items];
+    const item = items[itemIndex];
+    const children = [...item.children];
+    children[childIndex] = value;
+    items[itemIndex] = { ...item, children };
+    sections[sectionIndex] = { ...section, items };
+    applyLocalLog({ ...current, sections });
+  };
+
+  const updateItemFooter = (sectionIndex: number, itemIndex: number, footerIndex: number, value: string) => {
+    const current = localLogRef.current;
+    const sections = [...current.sections];
+    const section = sections[sectionIndex];
+    const items = [...section.items];
+    const item = items[itemIndex];
+    const footers = [...(item.footers ?? [])];
+    footers[footerIndex] = value;
+    items[itemIndex] = { ...item, footers };
+    sections[sectionIndex] = { ...section, items };
+    applyLocalLog({ ...current, sections });
+  };
+
+  const updateBottomFooter = (value: string) => {
+    applyLocalLog({ ...localLogRef.current, footer: value });
   };
 
   const moveSection = (index: number, direction: -1 | 1) => setLog((draft) => {
@@ -707,7 +923,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
     if (target < 0 || target >= draft.sections.length) return;
     const [section] = draft.sections.splice(index, 1);
     draft.sections.splice(target, 0, section);
-  });
+  }, true);
 
   const moveItem = (sectionIndex: number, itemIndex: number, direction: -1 | 1) => setLog((draft) => {
     const items = draft.sections[sectionIndex].items;
@@ -715,21 +931,21 @@ const StructuredEditor = React.memo(function StructuredEditor({
     if (target < 0 || target >= items.length) return;
     const [item] = items.splice(itemIndex, 1);
     items.splice(target, 0, item);
-  });
+  }, true);
 
   const moveItemToSection = (sectionIndex: number, itemIndex: number, targetSectionIndex: number) => setLog((draft) => {
     if (sectionIndex === targetSectionIndex) return;
     const sourceItems = draft.sections[sectionIndex].items;
     const [item] = sourceItems.splice(itemIndex, 1);
     draft.sections[targetSectionIndex].items.push(item);
-  });
+  }, true);
 
   const addBulletToSection = (sectionIndex = clampedActiveSectionIndex) => setLog((draft) => {
     if (!draft.sections[sectionIndex]) {
       draft.sections.push({ title: "GENERAL", items: [] });
     }
     draft.sections[sectionIndex].items.push({ text: "Added ", children: [], footers: [] });
-  });
+  }, true);
 
   const toggleSection = (sectionIndex: number, element: HTMLElement | null) => {
     const collapsed = !collapsedSectionsRef.current.has(sectionIndex);
@@ -739,7 +955,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
   };
 
   const collapseAll = () => {
-    collapsedSectionsRef.current = new Set(log.sections.map((_section, index) => index));
+    collapsedSectionsRef.current = new Set(localLog.sections.map((_section, index) => index));
     structuredRef.current?.querySelectorAll<HTMLElement>(".sectionEditor").forEach((section) => section.classList.add("collapsed"));
   };
   const expandAll = () => {
@@ -763,11 +979,11 @@ const StructuredEditor = React.memo(function StructuredEditor({
       <div className="structuredTop">
         <label className="updateTitleField">
           <span>Draft Title:</span>
-          <MarkdownTextInput className="updateTitleInput" value={log.title} onChange={(value) => setLog((draft) => { draft.title = value; })} />
+          <MarkdownTextInput className="updateTitleInput" value={localLog.title} onChange={updateTitle} />
         </label>
         <div className="structureStats">
-          <span>{log.sections.length} sections</span>
-          <span>{log.sections.reduce((total, section) => total + section.items.length, 0)} bullets</span>
+          <span>{localLog.sections.length} sections</span>
+          <span>{localLog.sections.reduce((total, section) => total + section.items.length, 0)} bullets</span>
         </div>
       </div>
       <div className="stickyAddBar">
@@ -783,33 +999,33 @@ const StructuredEditor = React.memo(function StructuredEditor({
           <Plus size={16} /> Add Bullet
         </button>
       </div>
-      {log.sections.map((section, sectionIndex) => (
-        <section key={`${section.title}-${sectionIndex}`} data-section-index={sectionIndex} className={collapsedSectionsRef.current.has(sectionIndex) ? "sectionEditor collapsed" : "sectionEditor"} onClick={() => setActiveSectionIndex(sectionIndex)}>
+      {localLog.sections.map((section, sectionIndex) => (
+        <section key={`section-${sectionIndex}`} data-section-index={sectionIndex} className={collapsedSectionsRef.current.has(sectionIndex) ? "sectionEditor collapsed" : "sectionEditor"} onClick={() => setActiveSectionIndex(sectionIndex)}>
           <div className="sectionSummary">
             <div className="sectionHeading">
               <button className="collapseToggle" title="Expand or collapse section" onClick={(event) => { event.stopPropagation(); toggleSection(sectionIndex, event.currentTarget.closest(".sectionEditor")); }}>
                 <ChevronDown size={16} className="collapseIcon" />
               </button>
-              <MarkdownTextInput value={section.title} onChange={(value) => setLog((draft) => { draft.sections[sectionIndex].title = value; })} />
+              <MarkdownTextInput value={section.title} onChange={(value) => updateSectionTitle(sectionIndex, value)} />
               <span className="itemCount">{section.items.length} bullet{section.items.length === 1 ? "" : "s"}</span>
             </div>
             <div className="sectionActions">
               <button className="iconButton moveButton" title="Move section down" onClick={() => moveSection(sectionIndex, 1)}><ArrowDown size={15} /></button>
               <button className="iconButton moveButton" title="Move section up" onClick={() => moveSection(sectionIndex, -1)}><ArrowUp size={15} /></button>
-              <button className="iconButton dangerButton" title="Delete section" onClick={() => setLog((draft) => { draft.sections.splice(sectionIndex, 1); })}><X size={14} /></button>
+              <button className="iconButton dangerButton" title="Delete section" onClick={() => setLog((draft) => { draft.sections.splice(sectionIndex, 1); }, true)}><X size={14} /></button>
             </div>
           </div>
           <div className="sectionBody">
             <div className="sectionBodyInner">
               {section.items.map((item, itemIndex) => (
-                <div className="itemEditor" key={`${item.text}-${itemIndex}`}>
+                <div className="itemEditor" key={`item-${sectionIndex}-${itemIndex}`}>
                   <div className="itemLine">
                     <span className="bulletMarker">•</span>
-                    <MarkdownTextInput value={item.text} onChange={(value) => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].text = value; })} />
+                    <MarkdownTextInput value={item.text} onChange={(value) => updateItemText(sectionIndex, itemIndex, value)} />
                     <div className="itemTools">
                       <button className="iconButton moveButton" title="Move bullet down" onClick={() => moveItem(sectionIndex, itemIndex, 1)}><ArrowDown size={15} /></button>
                       <button className="iconButton moveButton" title="Move bullet up" onClick={() => moveItem(sectionIndex, itemIndex, -1)}><ArrowUp size={15} /></button>
-                      {log.sections.length > 1 && (
+                      {localLog.sections.length > 1 && (
                         <CustomSelect
                           compact
                           dense
@@ -820,34 +1036,31 @@ const StructuredEditor = React.memo(function StructuredEditor({
                           onChange={(value) => moveItemToSection(sectionIndex, itemIndex, Number(value))}
                         />
                       )}
-                      <button className="iconButton dangerButton" title="Delete bullet" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items.splice(itemIndex, 1); })}><X size={14} /></button>
+                      <button className="iconButton dangerButton" title="Delete bullet" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items.splice(itemIndex, 1); }, true)}><X size={14} /></button>
                     </div>
                   </div>
                   {item.children.map((child, childIndex) => (
-                    <div className="childLine" key={`${child}-${childIndex}`}>
+                    <div className="childLine" key={`child-${sectionIndex}-${itemIndex}-${childIndex}`}>
                       <span className="nestedMarker">◦</span>
-                      <MarkdownTextInput value={child} onChange={(value) => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].children[childIndex] = value; })} />
-                      <button className="iconButton dangerButton" title="Delete nested bullet" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].children.splice(childIndex, 1); })}><X size={14} /></button>
+                      <MarkdownTextInput value={child} onChange={(value) => updateChildText(sectionIndex, itemIndex, childIndex, value)} />
+                      <button className="iconButton dangerButton" title="Delete nested bullet" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].children.splice(childIndex, 1); }, true)}><X size={14} /></button>
                     </div>
                   ))}
                   {(item.footers ?? []).map((footer, footerIndex) => (
-                    <div className="footerLine" key={`${footer}-${footerIndex}`}>
+                    <div className="footerLine" key={`footer-${sectionIndex}-${itemIndex}-${footerIndex}`}>
                       <span className="footerMarker">-#</span>
-                      <MarkdownTextInput value={footer} placeholder="Subtext / footer under this bullet" onChange={(value) => setLog((draft) => {
-                        draft.sections[sectionIndex].items[itemIndex].footers ??= [];
-                        draft.sections[sectionIndex].items[itemIndex].footers![footerIndex] = value;
-                      })} />
-                      <button className="iconButton dangerButton" title="Delete subtext footer" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].footers?.splice(footerIndex, 1); })}><X size={14} /></button>
+                      <MarkdownTextInput value={footer} placeholder="Subtext / footer under this bullet" onChange={(value) => updateItemFooter(sectionIndex, itemIndex, footerIndex, value)} />
+                      <button className="iconButton dangerButton" title="Delete subtext footer" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].footers?.splice(footerIndex, 1); }, true)}><X size={14} /></button>
                     </div>
                   ))}
                   <div className="itemAddRow">
-                    <button className="subtle" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].children.push(""); })}>
+                    <button className="subtle" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].children.push(""); }, true)}>
                       <ListPlus size={14} /> Nested bullet
                     </button>
                     <button className="subtle" onClick={() => setLog((draft) => {
                       draft.sections[sectionIndex].items[itemIndex].footers ??= [];
                       draft.sections[sectionIndex].items[itemIndex].footers!.push("");
-                    })}>
+                    }, true)}>
                       <Plus size={14} /> Subtext footer
                     </button>
                   </div>
@@ -865,14 +1078,14 @@ const StructuredEditor = React.memo(function StructuredEditor({
           <Plus size={16} /> Add Bullet
         </button>
       </div>
-      <button className="primary" onClick={() => setLog((draft) => { draft.sections.push({ title: "NEW SECTION", items: [] }); })}>
+      <button className="primary" onClick={() => setLog((draft) => { draft.sections.push({ title: "NEW SECTION", items: [] }); }, true)}>
         <Plus size={16} /> Section
       </button>
       <label className="settingToggle footerToggle">
         <input
           type="checkbox"
-          checked={hasEveryoneFooter(log.footer)}
-          onChange={(event) => setLog((draft) => { draft.footer = setEveryoneFooter(draft.footer, event.target.checked); })}
+          checked={hasEveryoneFooter(localLog.footer)}
+          onChange={(event) => setLog((draft) => { draft.footer = setEveryoneFooter(draft.footer, event.target.checked); }, true)}
         />
         <span className="toggleBox"><Check size={18} /></span>
         <span>
@@ -885,7 +1098,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
           <strong>Bottom footer text</strong>
           <small>Custom final subtext lines. The @everyone toggle above writes the common Discord ping for you.</small>
         </span>
-        <textarea className="footerTextarea" value={log.footer} onChange={(event) => setLog((draft) => { draft.footer = event.target.value; })} />
+        <textarea className="footerTextarea" value={localLog.footer} onChange={(event) => updateBottomFooter(event.target.value)} />
       </label>
     </div>
   );

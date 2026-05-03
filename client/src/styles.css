@@ -628,6 +628,10 @@ textarea { resize: vertical; }
   color: #f5f8ff;
   font-weight: 650;
 }
+.updateTitleInput .markdownTextControl {
+  font-weight: 650;
+  caret-color: #f8fbff;
+}
 .updateTitleInput .markdownTextControl:focus {
   border-color: transparent;
   box-shadow: none;
