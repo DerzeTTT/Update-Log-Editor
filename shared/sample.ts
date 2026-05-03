@@ -2,16 +2,16 @@ export const sampleMarkdown = `## DUELS & HEIAN BIRD UPDATE :EVIL_BIRD:
 
 ### GENERAL
 - Added **Domain Clashing**
-  - Using Domain within the same radius as someone or multiple other people causes everyone’s Domains to clash
+  - Using Domain within the same radius as someone or multiple other people causes everyone's Domains to clash
   - Starts a minigame where you have to center a circle to gain points and win the clash
-  - Being attacked throws off your circle’s balance, and you can throw off others’ balance too
+  - Being attacked throws off your circle's balance, and you can throw off others' balance too
 - Added Anti-Cheat
 - Added **VIP Cape**
   - Comes with custom image and color settings
 - Added **Reverse Cursed Technique**
   - Press G to regenerate a random limb if you lose one
   - Uses up 5% of your Awakening bar and heals you for 5 HP
-  - You can’t use Awakenings with missing limbs until they all regenerate
+  - You can't use Awakenings with missing limbs until they all regenerate
 - Added **Cross-Server Duels Matchmaking** with ELO
 - Added **Casual** and **Ranked** duel gamemodes with 1v1s and 2v2s
   - Casual gives less ELO than Ranked, but Binding Vows are enabled in it
@@ -54,7 +54,7 @@ export const sampleMarkdown = `## DUELS & HEIAN BIRD UPDATE :EVIL_BIRD:
 - Added Awakening move - Devastate
 - Added Awakening move - Bisect
   - Can be used 3 times
-  - Hitting Spear on someone rolling in Sever’s knockback activates a custom cutscene
+  - Hitting Spear on someone rolling in Sever's knockback activates a custom cutscene
 - Added Awakening move - Domain Expansion
 - Buffed Slam Down damage from 4 to 6
 - Dismantle aftercut damage nerfed from 6 to 4
@@ -69,7 +69,7 @@ export const sampleMarkdown = `## DUELS & HEIAN BIRD UPDATE :EVIL_BIRD:
   - Now uses an actual projectile and redirect
 - Close-up knockback on Reversal Red is stronger
 - Flash Collapse explosion and splash hitbox should perform better
-- Changed some VFX to be cleaner and match the rest of the game’s quality
+- Changed some VFX to be cleaner and match the rest of the game's quality
 - A lot of other changes
 
 ### PRIVATE SERVER PLUS

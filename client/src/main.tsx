@@ -284,10 +284,12 @@ type MonacoEditorLike = {
 function RawMarkdownEditor({
   value,
   syncVersion,
+  isActive,
   onChange
 }: {
   value: string;
   syncVersion: number;
+  isActive: boolean;
   onChange: (value: string) => void;
 }) {
   const editorRef = useRef<MonacoEditorLike | null>(null);
@@ -296,6 +298,7 @@ function RawMarkdownEditor({
   latestValueRef.current = value;
 
   useEffect(() => {
+    if (!isActive) return;
     const editor = editorRef.current;
     if (!editor || editor.getValue() === value) return;
 
@@ -312,7 +315,7 @@ function RawMarkdownEditor({
     } finally {
       applyingExternalValueRef.current = false;
     }
-  }, [syncVersion]);
+  }, [syncVersion, isActive, value]);
 
   return (
     <Editor
@@ -370,6 +373,8 @@ function App() {
   const [lastManualSaveAt, setLastManualSaveAt] = useState<string>("");
   const [rawEditorSyncVersion, setRawEditorSyncVersion] = useState(0);
   const hydratedDraftIdRef = useRef("");
+  const rawParseTimeoutRef = useRef<number | null>(null);
+  const [, startRawParseTransition] = useTransition();
   const queryClient = useQueryClient();
 
   const draftsQuery = useQuery({
@@ -437,6 +442,12 @@ function App() {
     if (activeDraft.id === hydratedDraftIdRef.current) return;
     hydrateDraft(activeDraft);
   }, [activeDraft?.id]);
+
+  useEffect(() => () => {
+    if (rawParseTimeoutRef.current !== null) {
+      window.clearTimeout(rawParseTimeoutRef.current);
+    }
+  }, []);
 
   const saveMutation = useMutation({
     mutationFn: (payload: { name?: string; rawMarkdown: string; structured: UpdateLog }) =>
@@ -533,9 +544,16 @@ function App() {
 
   const updateFromRaw = useCallback((value: string) => {
     setRawMarkdown(value);
-    const parsed = parseUpdateLog(value);
-    setStructured(parsed.log);
-    setDiagnostics(parsed.diagnostics);
+    if (rawParseTimeoutRef.current !== null) {
+      window.clearTimeout(rawParseTimeoutRef.current);
+    }
+    rawParseTimeoutRef.current = window.setTimeout(() => {
+      const parsed = parseUpdateLog(value);
+      startRawParseTransition(() => {
+        setStructured(parsed.log);
+        setDiagnostics(parsed.diagnostics);
+      });
+    }, 180);
   }, []);
 
   const updateStructured = useCallback((next: UpdateLog) => {
@@ -631,7 +649,7 @@ function App() {
               </button>
             </div>
             <div className={`editorMode ${tab === "raw" ? `active ${editorSlideDirection}` : "inactive"} monacoShell`} aria-hidden={tab !== "raw"}>
-                <RawMarkdownEditor value={rawMarkdown} syncVersion={rawEditorSyncVersion} onChange={updateFromRaw} />
+                <RawMarkdownEditor value={rawMarkdown} syncVersion={rawEditorSyncVersion} isActive={tab === "raw"} onChange={updateFromRaw} />
               </div>
               <div className={`editorMode ${tab === "structured" ? `active ${editorSlideDirection}` : "inactive"} structuredShell`} aria-hidden={tab !== "structured"}>
                 <StructuredEditor
@@ -659,10 +677,10 @@ function App() {
             </div>
             <div className="sideContent">
               <div className={`sideMode ${sideTab === "preview" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "preview"}>
-                <Preview rawMarkdown={deferredRawMarkdown} />
+                {sideTab === "preview" && <Preview rawMarkdown={deferredRawMarkdown} />}
               </div>
               <div className={`sideMode ${sideTab === "split" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "split"}>
-                <SplitPanel
+                {sideTab === "split" && <SplitPanel
                   result={splitResult}
                   onCopy={toastCopy}
                   rawMarkdown={deferredRawMarkdown}
@@ -671,16 +689,16 @@ function App() {
                     const current = settingsQuery.data?.settings;
                     if (current) updateSettings.mutate({ ...current, continuationHeaders: enabled });
                   }}
-                />
+                />}
               </div>
               <div className={`sideMode ${sideTab === "ai" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "ai"}>
-                {activeDraft && <AiPanel draftId={activeDraft.id} rawMarkdown={rawMarkdown} structured={structured} onApply={updateStructured} />}
+                {sideTab === "ai" && activeDraft && <AiPanel draftId={activeDraft.id} rawMarkdown={rawMarkdown} structured={structured} onApply={updateStructured} />}
               </div>
               <div className={`sideMode ${sideTab === "history" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "history"}>
-                {activeDraft && <HistoryPanel draftId={activeDraft.id} />}
+                {sideTab === "history" && activeDraft && <HistoryPanel draftId={activeDraft.id} />}
               </div>
               <div className={`sideMode ${sideTab === "settings" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "settings"}>
-                {settingsQuery.data && <SettingsPanel settings={settingsQuery.data.settings} />}
+                {sideTab === "settings" && settingsQuery.data && <SettingsPanel settings={settingsQuery.data.settings} />}
               </div>
             </div>
           </div>
@@ -944,7 +962,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
     if (!draft.sections[sectionIndex]) {
       draft.sections.push({ title: "GENERAL", items: [] });
     }
-    draft.sections[sectionIndex].items.push({ text: "Added ", children: [], footers: [] });
+    draft.sections[sectionIndex].items.push({ text: "", children: [], footers: [] });
   }, true);
 
   const toggleSection = (sectionIndex: number, element: HTMLElement | null) => {
@@ -1020,7 +1038,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
               {section.items.map((item, itemIndex) => (
                 <div className="itemEditor" key={`item-${sectionIndex}-${itemIndex}`}>
                   <div className="itemLine">
-                    <span className="bulletMarker">•</span>
+                    <span className="bulletMarker">{"\u2022"}</span>
                     <MarkdownTextInput value={item.text} onChange={(value) => updateItemText(sectionIndex, itemIndex, value)} />
                     <div className="itemTools">
                       <button className="iconButton moveButton" title="Move bullet down" onClick={() => moveItem(sectionIndex, itemIndex, 1)}><ArrowDown size={15} /></button>
@@ -1041,7 +1059,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
                   </div>
                   {item.children.map((child, childIndex) => (
                     <div className="childLine" key={`child-${sectionIndex}-${itemIndex}-${childIndex}`}>
-                      <span className="nestedMarker">◦</span>
+                      <span className="nestedMarker">{"\u25e6"}</span>
                       <MarkdownTextInput value={child} onChange={(value) => updateChildText(sectionIndex, itemIndex, childIndex, value)} />
                       <button className="iconButton dangerButton" title="Delete nested bullet" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].children.splice(childIndex, 1); }, true)}><X size={14} /></button>
                     </div>
@@ -1193,11 +1211,11 @@ function DiscordMarkdown({ raw }: { raw: string }) {
       return;
     }
     if (line.startsWith("  - ")) {
-      nodes.push(<div className="previewBullet nested" key={index}><span>◦</span><p>{renderInline(line.slice(4))}</p></div>);
+      nodes.push(<div className="previewBullet nested" key={index}><span>{"\u25e6"}</span><p>{renderInline(line.slice(4))}</p></div>);
       return;
     }
     if (line.startsWith("- ")) {
-      nodes.push(<div className="previewBullet" key={index}><span>•</span><p>{renderInline(line.slice(2))}</p></div>);
+      nodes.push(<div className="previewBullet" key={index}><span>{"\u2022"}</span><p>{renderInline(line.slice(2))}</p></div>);
       return;
     }
     nodes.push(<p key={index}>{renderInline(line)}</p>);

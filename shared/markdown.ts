@@ -6,7 +6,20 @@ export type ParseResult = {
 };
 
 export function normalizeNewlines(value: string): string {
-  return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+  return repairMojibake(value).replace(/\r\n/g, "\n").replace(/\r/g, "\n").trimEnd();
+}
+
+export function repairMojibake(value: string): string {
+  return value
+    .replace(/\u00e2\u20ac\u2122/g, "'")
+    .replace(/\u00e2\u2122/g, "'")
+    .replace(/\u00e2\u20ac\u0153/g, '"')
+    .replace(/\u00e2\u20ac[\u009d\ufffd]/g, '"')
+    .replace(/\u00e2\u20ac\u201c/g, "-")
+    .replace(/\u00e2\u20ac\u201d/g, "-")
+    .replace(/\u00e2\u20ac\u00a6/g, "...")
+    .replace(/\u00e2\u20ac\u00a2/g, "*")
+    .replace(/\u00e2\u2014\u00a6/g, "o");
 }
 
 export function parseUpdateLog(raw: string): ParseResult {
@@ -94,30 +107,35 @@ export function parseUpdateLog(raw: string): ParseResult {
 }
 
 export function serializeUpdateLog(log: UpdateLog): string {
-  const lines: string[] = [`## ${log.title.trim()}`];
+  const clean = (value: string) => repairMojibake(value).trim();
+  const lines: string[] = [`## ${clean(log.title)}`];
 
   for (const section of log.sections) {
-    lines.push("", `### ${section.title.trim()}`);
+    lines.push("", `### ${clean(section.title)}`);
     for (const item of section.items) {
-      if (!item.text.trim()) {
+      const text = clean(item.text);
+      if (!text) {
         continue;
       }
-      lines.push(`- ${item.text.trim()}`);
+      lines.push(`- ${text}`);
       for (const child of item.children) {
-        if (child.trim()) {
-          lines.push(`  - ${child.trim()}`);
+        const childText = clean(child);
+        if (childText) {
+          lines.push(`  - ${childText}`);
         }
       }
       for (const footer of item.footers ?? []) {
-        if (footer.trim()) {
-          lines.push(`  -# ${footer.trim().replace(/^-#\s*/, "")}`);
+        const footerText = clean(footer);
+        if (footerText) {
+          lines.push(`  -# ${footerText.replace(/^-#\s*/, "")}`);
         }
       }
     }
   }
 
-  if (log.footer.trim()) {
-    lines.push("", log.footer.trim());
+  const footer = repairMojibake(log.footer).trim();
+  if (footer) {
+    lines.push("", footer);
   }
 
   return lines.join("\n");

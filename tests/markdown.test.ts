@@ -9,7 +9,7 @@ describe("update log markdown", () => {
     expect(log.sections.length).toBeGreaterThan(5);
     expect(log.sections[0].title).toBe("GENERAL");
     expect(log.sections[0].items[0].text).toBe("Added **Domain Clashing**");
-    expect(log.sections[0].items[0].children[0]).toContain("causes everyone’s Domains to clash");
+    expect(log.sections[0].items[0].children[0]).toContain("causes everyone's Domains to clash");
     expect(log.footer).toBe("-# ||@everyone||");
   });
 
@@ -28,5 +28,12 @@ describe("update log markdown", () => {
     expect(serializeUpdateLog(log)).toContain(":star:");
     expect(serializeUpdateLog(log)).toContain(":EVIL_BIRD:");
     expect(serializeUpdateLog(log)).toContain(":HONORED_BIRD:");
+  });
+
+  it("repairs common mojibake from smart punctuation", () => {
+    const markdown = "## Test\n\n### GENERAL\n- You can\u00e2\u2122t use this\n- everyone\u00e2\u20ac\u2122s update\n\n-# ||@everyone||";
+    const { log } = parseUpdateLog(markdown);
+    expect(log.sections[0].items[0].text).toBe("You can't use this");
+    expect(serializeUpdateLog(log)).toContain("- everyone's update");
   });
 });
