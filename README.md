@@ -2,6 +2,36 @@
 
 Roblox project for editing and managing update log content.
 
+## Starting the App
+
+The reliable way to start the editor is from this project folder:
+
+```powershell
+Set-Location -LiteralPath "D:\Update Log Editor"
+npm start
+```
+
+This starts both the API server and the Vite frontend, then opens:
+
+```text
+http://127.0.0.1:5173
+```
+
+For normal desktop use, you can also double-click:
+
+```text
+Start Update Log Editor.bat
+```
+
+If Codex or another tool has trouble opening the browser automatically, start it without auto-open:
+
+```powershell
+Set-Location -LiteralPath "D:\Update Log Editor"
+npm run start:headless
+```
+
+Then open `http://127.0.0.1:5173` manually. Leave the terminal window running while using the editor; closing it stops the app.
+
 ## Direct Markdown Files
 
 The app also mirrors every draft to a plain Markdown file:

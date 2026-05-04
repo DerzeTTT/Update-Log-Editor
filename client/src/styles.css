@@ -216,6 +216,13 @@ textarea { resize: vertical; }
   caret-color: #ffffff;
   background: transparent;
 }
+.markdownTextInput.editing .markdownTextPreview {
+  display: none;
+}
+.markdownTextInput.editing .markdownTextControl {
+  color: #e7edf5;
+  background: rgba(4,4,6,0.22);
+}
 .markdownTextControl::placeholder {
   color: #667388;
 }
@@ -301,6 +308,9 @@ textarea { resize: vertical; }
   transform: translate3d(var(--glow-x), var(--glow-y), 0) scale(0.54);
   animation: ambientGlowDrift var(--glow-duration) linear forwards;
   will-change: transform, opacity;
+}
+.app:focus-within .ambientGlow {
+  animation-play-state: paused;
 }
 @keyframes ambientGlowDrift {
   0% {
@@ -478,6 +488,7 @@ textarea { resize: vertical; }
 .editorMode {
   flex: 1;
   min-height: 0;
+  contain: layout paint style;
 }
 .editorMode.inactive {
   position: absolute;
@@ -490,12 +501,14 @@ textarea { resize: vertical; }
   visibility: hidden;
   pointer-events: none;
   overflow: hidden;
+  content-visibility: hidden;
 }
 .editorMode.active {
   position: relative;
   z-index: 1;
   display: flex;
   flex-direction: column;
+  content-visibility: auto;
 }
 .editorMode.active.slideForward {
   animation: tabSlideForward 150ms ease both;
@@ -763,9 +776,46 @@ textarea { resize: vertical; }
   display: none;
 }
 .sectionActions { display: flex; gap: 6px; align-items: center; }
-.itemEditor { border-top: 1px solid var(--line); padding: 8px 0; margin-top: 8px; transition: background 140ms ease; border-radius: 7px; }
+.itemEditor {
+  position: relative;
+  border-top: 1px solid var(--line);
+  padding: 8px 0;
+  margin-top: 8px;
+  transition: background 140ms ease, opacity 140ms ease;
+  border-radius: 7px;
+}
 .itemEditor:hover { background: rgba(76,131,255,0.045); }
-.itemLine { display: grid; grid-template-columns: 18px minmax(220px, 1fr) auto; gap: 8px; align-items: center; margin-bottom: 7px; }
+.itemEditor.dragging {
+  opacity: 0.52;
+}
+.itemEditor.dragTarget-before::before,
+.itemEditor.dragTarget-after::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  border-radius: 999px;
+  background: #6b97ff;
+  box-shadow: 0 0 18px rgba(107,151,255,0.42);
+}
+.itemEditor.dragTarget-before::before { top: -1px; }
+.itemEditor.dragTarget-after::after { bottom: -1px; }
+.itemLine { display: grid; grid-template-columns: 34px 18px minmax(220px, 1fr) auto; gap: 8px; align-items: center; margin-bottom: 7px; }
+.dragHandle {
+  color: #9fb0c8;
+  border-color: transparent;
+  background: transparent;
+  cursor: grab;
+}
+.dragHandle:hover {
+  color: #ffffff;
+  border-color: #4c83ff;
+  background: #151820;
+}
+.dragHandle:active {
+  cursor: grabbing;
+}
 .itemTools {
   display: flex;
   align-items: center;
@@ -964,7 +1014,7 @@ textarea { resize: vertical; }
   scrollbar-color: #52647e transparent;
   transform-origin: top center;
   animation: menuDrop 150ms cubic-bezier(.2,.9,.18,1) both;
-  will-change: transform, opacity, max-height;
+  will-change: transform, opacity;
 }
 .customSelectMenu.closing {
   pointer-events: none;
@@ -977,12 +1027,12 @@ textarea { resize: vertical; }
   background-clip: padding-box;
 }
 @keyframes menuDrop {
-  from { opacity: 0; max-height: 0; transform: translateY(-5px) scaleY(0.96); }
-  to { opacity: 1; max-height: 210px; transform: translateY(0) scaleY(1); }
+  from { opacity: 0; transform: translateY(-5px) scaleY(0.96); }
+  to { opacity: 1; transform: translateY(0) scaleY(1); }
 }
 @keyframes menuPull {
-  from { opacity: 1; max-height: 210px; transform: translateY(0) scaleY(1); }
-  to { opacity: 0; max-height: 0; transform: translateY(-5px) scaleY(0.96); }
+  from { opacity: 1; transform: translateY(0) scaleY(1); }
+  to { opacity: 0; transform: translateY(-5px) scaleY(0.96); }
 }
 .customSelectMenu button {
   width: 100%;

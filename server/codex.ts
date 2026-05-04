@@ -194,12 +194,17 @@ export async function updateCodexCli() {
   };
 }
 
-function extractFinalJson(stdout: string): unknown {
+export function extractFinalJson(stdout: string): unknown {
   let lastMessage = "";
+  let lastNonEventLine = "";
   for (const line of stdout.split(/\r?\n/)) {
     if (!line.trim()) continue;
     try {
       const event = JSON.parse(line);
+      if (event.type === "item.completed" && event.item?.type === "agent_message" && typeof event.item.text === "string") {
+        lastMessage = event.item.text;
+        continue;
+      }
       const message = event.message ?? event.msg ?? event.output ?? event.text;
       if (typeof message === "string") {
         lastMessage = message;
@@ -211,11 +216,11 @@ function extractFinalJson(stdout: string): unknown {
         lastMessage = event.last_message;
       }
     } catch {
-      lastMessage = line;
+      lastNonEventLine = line;
     }
   }
 
-  const trimmed = lastMessage.trim();
+  const trimmed = (lastMessage || lastNonEventLine).trim();
   if (!trimmed) {
     throw new Error("Codex returned no assistant message.");
   }
@@ -271,7 +276,7 @@ Current raw Markdown:
 ${input.rawMarkdown}
 
 Respond with:
-{"summary":"Short explanation of changes","updatedLog":{"title":"...","sections":[{"title":"...","items":[{"text":"...","children":["..."]}]}],"footer":"..."}}`;
+{"summary":"Short explanation of changes","updatedLog":{"title":"...","sections":[{"title":"...","items":[{"text":"...","children":["..."],"footers":[]}]}],"footer":"..."}}`;
 
   const result = await runCommand("codex", args, prompt, 180000);
   if (result.code !== 0) {

@@ -14,6 +14,7 @@ import {
   Download,
   FilePlus,
   FileText,
+  GripVertical,
   History,
   Eye,
   ListPlus,
@@ -40,6 +41,8 @@ type SelectOption = { value: string; label: string; meta?: string };
 type EditorTab = "raw" | "structured";
 type SideTab = "preview" | "split" | "ai" | "history" | "settings";
 type SlideDirection = "slideForward" | "slideBack";
+type BulletDragLocation = { sectionIndex: number; itemIndex: number };
+type BulletDropTarget = BulletDragLocation & { side: "before" | "after" };
 type AmbientGlow = {
   id: number;
   color: string;
@@ -54,6 +57,8 @@ const sectionMenuOptionsLimit = 12;
 const everyoneFooter = "-# ||@everyone||";
 const editorTabOrder: EditorTab[] = ["raw", "structured"];
 const sideTabOrder: SideTab[] = ["preview", "split", "ai", "history", "settings"];
+const markdownInputCommitDelayMs = 650;
+const rawParseDebounceMs = 360;
 const codexStatusQueryOptions = {
   staleTime: 30_000,
   refetchOnWindowFocus: false
@@ -220,47 +225,82 @@ const MarkdownTextInput = React.memo(function MarkdownTextInput({
   className?: string;
 }) {
   const [localValue, setLocalValue] = useState(value);
+  const [isFocused, setIsFocused] = useState(false);
   const commitTimeoutRef = useRef<number | null>(null);
+  const hasPendingCommitRef = useRef(false);
+  const latestValueRef = useRef(value);
+  const lastCommittedValueRef = useRef(value);
+  const onChangeRef = useRef(onChange);
 
   useEffect(() => {
-    setLocalValue(value);
-  }, [value]);
+    onChangeRef.current = onChange;
+  }, [onChange]);
 
-  useEffect(() => () => {
-    if (commitTimeoutRef.current !== null) {
-      window.clearTimeout(commitTimeoutRef.current);
+  useEffect(() => {
+    lastCommittedValueRef.current = value;
+    if (!isFocused && latestValueRef.current !== value) {
+      latestValueRef.current = value;
+      setLocalValue(value);
     }
-  }, []);
+  }, [value, isFocused]);
 
-  const commit = (next: string) => {
+  const clearCommitTimeout = () => {
     if (commitTimeoutRef.current !== null) {
       window.clearTimeout(commitTimeoutRef.current);
       commitTimeoutRef.current = null;
     }
-    onChange(next);
+  };
+
+  const commit = (next: string) => {
+    clearCommitTimeout();
+    hasPendingCommitRef.current = false;
+    latestValueRef.current = next;
+    if (next !== lastCommittedValueRef.current) {
+      lastCommittedValueRef.current = next;
+      onChangeRef.current(next);
+    }
   };
 
   const scheduleCommit = (next: string) => {
-    if (commitTimeoutRef.current !== null) {
-      window.clearTimeout(commitTimeoutRef.current);
-    }
-    commitTimeoutRef.current = window.setTimeout(() => commit(next), 220);
+    latestValueRef.current = next;
+    hasPendingCommitRef.current = true;
+    clearCommitTimeout();
+    commitTimeoutRef.current = window.setTimeout(() => commit(next), markdownInputCommitDelayMs);
   };
 
+  useEffect(() => () => {
+    if (hasPendingCommitRef.current) {
+      commit(latestValueRef.current);
+    } else {
+      clearCommitTimeout();
+    }
+  }, []);
+
+  const preview = useMemo(() => {
+    if (isFocused) return null;
+    return renderStructuredInlineMarkdown(localValue);
+  }, [isFocused, localValue]);
+
   return (
-    <span className={`markdownTextInput ${className ?? ""}`}>
+    <span className={`markdownTextInput ${isFocused ? "editing" : ""} ${className ?? ""}`}>
       <span className="markdownTextPreview" aria-hidden="true">
-        {renderStructuredInlineMarkdown(localValue)}
+        {preview}
       </span>
       <input
         className="markdownTextControl"
         value={localValue}
         placeholder={placeholder}
+        onFocus={() => setIsFocused(true)}
         onChange={(event) => {
-          setLocalValue(event.target.value);
-          scheduleCommit(event.target.value);
+          const nextValue = event.target.value;
+          latestValueRef.current = nextValue;
+          setLocalValue(nextValue);
+          scheduleCommit(nextValue);
         }}
-        onBlur={(event) => commit(event.target.value)}
+        onBlur={(event) => {
+          commit(event.target.value);
+          setIsFocused(false);
+        }}
       />
     </span>
   );
@@ -300,7 +340,8 @@ function RawMarkdownEditor({
   useEffect(() => {
     if (!isActive) return;
     const editor = editorRef.current;
-    if (!editor || editor.getValue() === value) return;
+    const nextValue = latestValueRef.current;
+    if (!editor || editor.getValue() === nextValue) return;
 
     const selection = editor.getSelection();
     const scrollTop = editor.getScrollTop();
@@ -308,14 +349,14 @@ function RawMarkdownEditor({
 
     try {
       applyingExternalValueRef.current = true;
-      editor.setValue(value);
+      editor.setValue(nextValue);
       if (selection) editor.setSelection(selection);
       editor.setScrollTop(scrollTop);
       editor.setScrollLeft(scrollLeft);
     } finally {
       applyingExternalValueRef.current = false;
     }
-  }, [syncVersion, isActive, value]);
+  }, [syncVersion, isActive]);
 
   return (
     <Editor
@@ -329,7 +370,7 @@ function RawMarkdownEditor({
         fontSize: 14,
         lineHeight: 22,
         tabSize: 2,
-        automaticLayout: true,
+        automaticLayout: isActive,
         padding: { top: 10, bottom: 18 },
         unicodeHighlight: {
           ambiguousCharacters: false,
@@ -407,6 +448,18 @@ function App() {
     setRawEditorSyncVersion((version) => version + 1);
   };
 
+  const parseRawIntoStructured = useCallback((value: string) => {
+    if (rawParseTimeoutRef.current !== null) {
+      window.clearTimeout(rawParseTimeoutRef.current);
+      rawParseTimeoutRef.current = null;
+    }
+    const parsed = parseUpdateLog(value);
+    startRawParseTransition(() => {
+      setStructured(parsed.log);
+      setDiagnostics(parsed.diagnostics);
+    });
+  }, []);
+
   const selectDraft = (draft: DraftRecord) => {
     if (draft.id === selectedDraftId) return;
     const drafts = draftsQuery.data?.drafts ?? [];
@@ -421,6 +474,9 @@ function App() {
 
   const switchEditorTab = (next: EditorTab) => {
     if (next === tab) return;
+    if (next === "structured" && tab === "raw") {
+      parseRawIntoStructured(rawMarkdown);
+    }
     setEditorSlideDirection(editorTabOrder.indexOf(next) > editorTabOrder.indexOf(tab) ? "slideForward" : "slideBack");
     setTab(next);
   };
@@ -466,10 +522,11 @@ function App() {
   useEffect(() => {
     if (!selectedDraftId || !settingsQuery.data) return;
     const timeout = window.setTimeout(() => {
-      saveMutation.mutate({ name: draftName, rawMarkdown, structured });
+      const latestStructured = tab === "raw" ? parseUpdateLog(rawMarkdown).log : structured;
+      saveMutation.mutate({ name: draftName, rawMarkdown, structured: latestStructured });
     }, settingsQuery.data.settings.autosaveIntervalMs);
     return () => window.clearTimeout(timeout);
-  }, [rawMarkdown, structured, draftName, selectedDraftId, settingsQuery.data?.settings.autosaveIntervalMs]);
+  }, [rawMarkdown, structured, draftName, selectedDraftId, tab, settingsQuery.data?.settings.autosaveIntervalMs]);
 
   const createDraft = useMutation({
     mutationFn: () => api<DraftResponse>("/api/drafts", { method: "POST", body: JSON.stringify({ name: "Untitled Update" }) }),
@@ -517,14 +574,15 @@ function App() {
   const saveVersion = useMutation({
     mutationFn: () => {
       if (!selectedDraftId) throw new Error("No draft selected.");
-      const nextName = draftNameFromUpdateTitle(structured.title || draftName);
+      const latestStructured = tab === "raw" ? parseUpdateLog(rawMarkdown).log : structured;
+      const nextName = draftNameFromUpdateTitle(latestStructured.title || draftName);
       return api<SaveVersionResponse>(`/api/drafts/${selectedDraftId}/save-version`, {
         method: "POST",
         body: JSON.stringify({
           label: "Manual save",
           name: nextName,
           rawMarkdown,
-          structured
+          structured: latestStructured
         })
       });
     },
@@ -548,13 +606,9 @@ function App() {
       window.clearTimeout(rawParseTimeoutRef.current);
     }
     rawParseTimeoutRef.current = window.setTimeout(() => {
-      const parsed = parseUpdateLog(value);
-      startRawParseTransition(() => {
-        setStructured(parsed.log);
-        setDiagnostics(parsed.diagnostics);
-      });
-    }, 180);
-  }, []);
+      parseRawIntoStructured(value);
+    }, rawParseDebounceMs);
+  }, [parseRawIntoStructured]);
 
   const updateStructured = useCallback((next: UpdateLog) => {
     setStructured(next);
@@ -564,6 +618,7 @@ function App() {
   }, []);
 
   const splitResult = useMemo(() => {
+    if (sideTab !== "split") return null;
     const settings = settingsQuery.data?.settings;
     return splitDiscordMessages(deferredRawMarkdown, {
       mode: settings?.characterLimitMode ?? "normal",
@@ -572,7 +627,7 @@ function App() {
       title: deferredStructured.title,
       footer: deferredStructured.footer
     });
-  }, [deferredRawMarkdown, settingsQuery.data, deferredStructured.title, deferredStructured.footer]);
+  }, [sideTab, deferredRawMarkdown, settingsQuery.data?.settings, deferredStructured.title, deferredStructured.footer]);
 
   const toastCopy = async (text: string, label: string) => {
     await copyText(text);
@@ -680,7 +735,7 @@ function App() {
                 {sideTab === "preview" && <Preview rawMarkdown={deferredRawMarkdown} />}
               </div>
               <div className={`sideMode ${sideTab === "split" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "split"}>
-                {sideTab === "split" && <SplitPanel
+                {sideTab === "split" && splitResult && <SplitPanel
                   result={splitResult}
                   onCopy={toastCopy}
                   rawMarkdown={deferredRawMarkdown}
@@ -836,6 +891,9 @@ const StructuredEditor = React.memo(function StructuredEditor({
   const localLogRef = useRef(log);
   const lastPropagatedLogRef = useRef<UpdateLog | null>(null);
   const commitTimeoutRef = useRef<number | null>(null);
+  const bulletDragRef = useRef<BulletDragLocation | null>(null);
+  const [bulletDrag, setBulletDrag] = useState<BulletDragLocation | null>(null);
+  const [bulletDropTarget, setBulletDropTarget] = useState<BulletDropTarget | null>(null);
   localLogRef.current = localLog;
 
   useEffect(() => {
@@ -958,6 +1016,59 @@ const StructuredEditor = React.memo(function StructuredEditor({
     draft.sections[targetSectionIndex].items.push(item);
   }, true);
 
+  const clearBulletDrag = () => {
+    bulletDragRef.current = null;
+    setBulletDrag(null);
+    setBulletDropTarget(null);
+  };
+
+  const beginBulletDrag = (event: React.DragEvent<HTMLElement>, location: BulletDragLocation) => {
+    bulletDragRef.current = location;
+    setBulletDrag(location);
+    setBulletDropTarget(null);
+    event.dataTransfer.effectAllowed = "move";
+    event.dataTransfer.setData("text/plain", `${location.sectionIndex}:${location.itemIndex}`);
+  };
+
+  const getDropSide = (event: React.DragEvent<HTMLElement>): "before" | "after" => {
+    const rect = event.currentTarget.getBoundingClientRect();
+    return event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+  };
+
+  const updateBulletDrop = (event: React.DragEvent<HTMLElement>, sectionIndex: number, itemIndex: number) => {
+    if (!bulletDragRef.current) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = "move";
+    const side = getDropSide(event);
+    setBulletDropTarget((current) => {
+      if (current?.sectionIndex === sectionIndex && current.itemIndex === itemIndex && current.side === side) return current;
+      return { sectionIndex, itemIndex, side };
+    });
+  };
+
+  const dropBullet = (event: React.DragEvent<HTMLElement>, sectionIndex: number, itemIndex: number) => {
+    const source = bulletDragRef.current;
+    if (!source) return;
+    event.preventDefault();
+    const side = getDropSide(event);
+    setLog((draft) => {
+      const sourceSection = draft.sections[source.sectionIndex];
+      const targetSection = draft.sections[sectionIndex];
+      if (!sourceSection || !targetSection) return;
+      const sourceItems = sourceSection.items;
+      if (source.itemIndex < 0 || source.itemIndex >= sourceItems.length) return;
+      let insertIndex = side === "after" ? itemIndex + 1 : itemIndex;
+      const [item] = sourceItems.splice(source.itemIndex, 1);
+      const targetItems = targetSection.items;
+      if (source.sectionIndex === sectionIndex && source.itemIndex < insertIndex) {
+        insertIndex -= 1;
+      }
+      insertIndex = Math.max(0, Math.min(insertIndex, targetItems.length));
+      targetItems.splice(insertIndex, 0, item);
+    }, true);
+    clearBulletDrag();
+  };
+
   const addBulletToSection = (sectionIndex = clampedActiveSectionIndex) => setLog((draft) => {
     if (!draft.sections[sectionIndex]) {
       draft.sections.push({ title: "GENERAL", items: [] });
@@ -1036,13 +1147,25 @@ const StructuredEditor = React.memo(function StructuredEditor({
           <div className="sectionBody">
             <div className="sectionBodyInner">
               {section.items.map((item, itemIndex) => (
-                <div className="itemEditor" key={`item-${sectionIndex}-${itemIndex}`}>
+                <div
+                  className={`itemEditor${bulletDrag?.sectionIndex === sectionIndex && bulletDrag.itemIndex === itemIndex ? " dragging" : ""}${bulletDropTarget?.sectionIndex === sectionIndex && bulletDropTarget.itemIndex === itemIndex ? ` dragTarget-${bulletDropTarget.side}` : ""}`}
+                  key={`item-${sectionIndex}-${itemIndex}`}
+                  onDragOver={(event) => updateBulletDrop(event, sectionIndex, itemIndex)}
+                  onDrop={(event) => dropBullet(event, sectionIndex, itemIndex)}
+                >
                   <div className="itemLine">
+                    <button
+                      className="iconButton dragHandle"
+                      title="Drag bullet to reorder"
+                      draggable
+                      onDragStart={(event) => beginBulletDrag(event, { sectionIndex, itemIndex })}
+                      onDragEnd={clearBulletDrag}
+                    >
+                      <GripVertical size={16} />
+                    </button>
                     <span className="bulletMarker">{"\u2022"}</span>
                     <MarkdownTextInput value={item.text} onChange={(value) => updateItemText(sectionIndex, itemIndex, value)} />
                     <div className="itemTools">
-                      <button className="iconButton moveButton" title="Move bullet down" onClick={() => moveItem(sectionIndex, itemIndex, 1)}><ArrowDown size={15} /></button>
-                      <button className="iconButton moveButton" title="Move bullet up" onClick={() => moveItem(sectionIndex, itemIndex, -1)}><ArrowUp size={15} /></button>
                       {localLog.sections.length > 1 && (
                         <CustomSelect
                           compact
@@ -1159,70 +1282,74 @@ const Preview = React.memo(function Preview({ rawMarkdown }: { rawMarkdown: stri
   );
 });
 
-function DiscordMarkdown({ raw }: { raw: string }) {
-  const lines = raw.replace(/\r\n/g, "\n").split("\n");
-  const nodes: React.ReactNode[] = [];
-  let codeLines: string[] = [];
-  let inCode = false;
+const DiscordMarkdown = React.memo(function DiscordMarkdown({ raw }: { raw: string }) {
+  const nodes = useMemo(() => {
+    const lines = raw.replace(/\r\n/g, "\n").split("\n");
+    const nextNodes: React.ReactNode[] = [];
+    let codeLines: string[] = [];
+    let inCode = false;
 
-  const flushCode = (key: number) => {
-    if (codeLines.length) {
-      nodes.push(<pre key={`code-${key}`}><code>{codeLines.join("\n")}</code></pre>);
-      codeLines = [];
-    }
-  };
-
-  lines.forEach((line, index) => {
-    if (line.trim().startsWith("```")) {
-      if (inCode) {
-        inCode = false;
-        flushCode(index);
-      } else {
-        inCode = true;
+    const flushCode = (key: number) => {
+      if (codeLines.length) {
+        nextNodes.push(<pre key={`code-${key}`}><code>{codeLines.join("\n")}</code></pre>);
+        codeLines = [];
       }
-      return;
-    }
-    if (inCode) {
-      codeLines.push(line);
-      return;
-    }
-    if (line.trim() === "") {
-      nodes.push(<div className="blankLine" key={index} />);
-      return;
-    }
-    if (line.startsWith("## ") && !line.startsWith("### ")) {
-      nodes.push(<h2 key={index}>{renderInline(line.slice(3))}</h2>);
-      return;
-    }
-    if (line.startsWith("### ")) {
-      nodes.push(<h3 key={index}>{renderInline(line.slice(4))}</h3>);
-      return;
-    }
-    if (line.startsWith("-# ")) {
-      nodes.push(<p className="subtext" key={index}>{renderInline(line.slice(3))}</p>);
-      return;
-    }
-    if (line.startsWith("  -# ")) {
-      nodes.push(<p className="subtext nestedSubtext" key={index}>{renderInline(line.slice(5))}</p>);
-      return;
-    }
-    if (line.startsWith("> ")) {
-      nodes.push(<blockquote key={index}>{renderInline(line.slice(2))}</blockquote>);
-      return;
-    }
-    if (line.startsWith("  - ")) {
-      nodes.push(<div className="previewBullet nested" key={index}><span>{"\u25e6"}</span><p>{renderInline(line.slice(4))}</p></div>);
-      return;
-    }
-    if (line.startsWith("- ")) {
-      nodes.push(<div className="previewBullet" key={index}><span>{"\u2022"}</span><p>{renderInline(line.slice(2))}</p></div>);
-      return;
-    }
-    nodes.push(<p key={index}>{renderInline(line)}</p>);
-  });
-  flushCode(lines.length + 1);
+    };
+
+    lines.forEach((line, index) => {
+      if (line.trim().startsWith("```")) {
+        if (inCode) {
+          inCode = false;
+          flushCode(index);
+        } else {
+          inCode = true;
+        }
+        return;
+      }
+      if (inCode) {
+        codeLines.push(line);
+        return;
+      }
+      if (line.trim() === "") {
+        nextNodes.push(<div className="blankLine" key={index} />);
+        return;
+      }
+      if (line.startsWith("## ") && !line.startsWith("### ")) {
+        nextNodes.push(<h2 key={index}>{renderInline(line.slice(3))}</h2>);
+        return;
+      }
+      if (line.startsWith("### ")) {
+        nextNodes.push(<h3 key={index}>{renderInline(line.slice(4))}</h3>);
+        return;
+      }
+      if (line.startsWith("-# ")) {
+        nextNodes.push(<p className="subtext" key={index}>{renderInline(line.slice(3))}</p>);
+        return;
+      }
+      if (line.startsWith("  -# ")) {
+        nextNodes.push(<p className="subtext nestedSubtext" key={index}>{renderInline(line.slice(5))}</p>);
+        return;
+      }
+      if (line.startsWith("> ")) {
+        nextNodes.push(<blockquote key={index}>{renderInline(line.slice(2))}</blockquote>);
+        return;
+      }
+      if (line.startsWith("  - ")) {
+        nextNodes.push(<div className="previewBullet nested" key={index}><span>{"\u25e6"}</span><p>{renderInline(line.slice(4))}</p></div>);
+        return;
+      }
+      if (line.startsWith("- ")) {
+        nextNodes.push(<div className="previewBullet" key={index}><span>{"\u2022"}</span><p>{renderInline(line.slice(2))}</p></div>);
+        return;
+      }
+      nextNodes.push(<p key={index}>{renderInline(line)}</p>);
+    });
+    flushCode(lines.length + 1);
+    return nextNodes;
+  }, [raw]);
+
   return <>{nodes}</>;
-}
+});
 
 function renderInline(text: string): React.ReactNode[] {
   const pattern = /(`[^`]+`|\|\|[^|]+\|\||\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
@@ -1262,8 +1389,11 @@ const SplitPanel = React.memo(function SplitPanel({
   settings?: AppSettings;
   onTogglePartHeaders: (enabled: boolean) => void;
 }) {
-  const structured = parseUpdateLog(rawMarkdown).log;
   const splitIntoMultipleParts = result.chunks.length > 1;
+  const exportJson = () => {
+    const structured = parseUpdateLog(rawMarkdown).log;
+    download("update-log-draft.json", JSON.stringify({ rawMarkdown, structured }, null, 2));
+  };
   const importJson = async (file: File | undefined) => {
     if (!file) return;
     const payload = JSON.parse(await file.text());
@@ -1312,7 +1442,7 @@ const SplitPanel = React.memo(function SplitPanel({
         <button onClick={() => onCopy(result.chunks.join("\n\n---\n\n"), "All parts copied")}><Copy size={15} /> Copy all</button>
         <button onClick={() => download("update-log.md", rawMarkdown)}><Download size={15} /> .md</button>
         <button onClick={() => download("update-log.txt", rawMarkdown)}><Download size={15} /> .txt</button>
-        <button onClick={() => download("update-log-draft.json", JSON.stringify({ rawMarkdown, structured }, null, 2))}><Download size={15} /> JSON</button>
+        <button onClick={exportJson}><Download size={15} /> JSON</button>
         <label className="fileButton">Import JSON<input type="file" accept="application/json,.json" onChange={(event) => importJson(event.target.files?.[0])} /></label>
       </div>
       {result.warnings.map((warning) => <div className="warning" key={warning}>{warning}</div>)}
@@ -1337,6 +1467,7 @@ function AiPanel({ draftId, rawMarkdown, structured, onApply }: { draftId: strin
     { value: "default", label: "Use Codex default", meta: `Uses ${displayModelName(codexDefaultModel)}` },
     { value: "gpt-5.5", label: "GPT-5.5", meta: "Newest listed option" },
     { value: "gpt-5.4", label: "GPT-5.4", meta: "Fallback option" },
+    { value: "gpt-5.3-codex-spark", label: "GPT-5.3 Spark", meta: "Fast coding option" },
     { value: "custom", label: "Custom model", meta: "Manual name" }
   ];
   const mutation = useMutation({
@@ -1441,6 +1572,7 @@ function SettingsPanel({ settings }: { settings: AppSettings }) {
   const modelOptions: SelectOption[] = [
     { value: "gpt-5.4", label: "GPT-5.4", meta: "Recommended for this CLI" },
     { value: "gpt-5.5", label: "GPT-5.5", meta: "Requires latest Codex" },
+    { value: "gpt-5.3-codex-spark", label: "GPT-5.3 Spark", meta: "Fast coding option" },
     { value: "default", label: "Use Codex default", meta: `Uses ${displayModelName(codexDefaultModel)}` },
     { value: "custom", label: "Custom model", meta: "Manual name" }
   ];

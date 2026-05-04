@@ -6,6 +6,10 @@ const processes = [];
 const env = { ...process.env, FORCE_COLOR: "1" };
 const args = new Set(process.argv.slice(2));
 const noOpen = args.has("--no-open") || args.has("--headless") || process.env.UPDATE_LOG_NO_OPEN === "1";
+const frontendUrl = "http://127.0.0.1:5173";
+const apiUrl = "http://127.0.0.1:4317";
+let shuttingDown = false;
+let exitingAfterFailure = false;
 
 function isPortOpen(port) {
   return new Promise((resolve) => {
@@ -31,11 +35,30 @@ function run(name, command, args) {
   });
   processes.push(child);
   child.on("exit", (code) => {
-    if (code && code !== 0) {
-      console.error(`${name} exited with code ${code}`);
+    if (shuttingDown || exitingAfterFailure) {
+      return;
     }
+    const exitCode = typeof code === "number" && code !== 0 ? code : 1;
+    console.error(`${name} exited unexpectedly${code === null ? "" : ` with code ${code}`}.`);
+    exitingAfterFailure = true;
+    shutdown();
+    process.exit(exitCode);
   });
   return child;
+}
+
+async function openFrontend() {
+  if (noOpen) {
+    return true;
+  }
+
+  try {
+    await open(frontendUrl);
+    return true;
+  } catch (error) {
+    console.error("Could not open browser:", error.message);
+    return false;
+  }
 }
 
 const apiRunning = await isPortOpen(4317);
@@ -43,17 +66,17 @@ const clientRunning = await isPortOpen(5173);
 
 if (apiRunning && clientRunning) {
   console.log("Update Log Editor is already running.");
-  console.log("Frontend: http://127.0.0.1:5173");
-  console.log("API: http://127.0.0.1:4317");
-  process.exit(0);
+  console.log(`Frontend: ${frontendUrl}`);
+  console.log(`API: ${apiUrl}`);
+  process.exit((await openFrontend()) ? 0 : 1);
 }
 
 if (apiRunning || clientRunning) {
   console.log("Update Log Editor appears to be partially running; not starting duplicate processes.");
-  if (apiRunning) console.log("API is already running on http://127.0.0.1:4317");
-  if (clientRunning) console.log("Frontend is already running on http://127.0.0.1:5173");
+  if (apiRunning) console.log(`API is already running on ${apiUrl}`);
+  if (clientRunning) console.log(`Frontend is already running on ${frontendUrl}`);
   console.log("Stop the existing process first if you want to restart it.");
-  process.exit(0);
+  process.exit(1);
 }
 
 run("server", "npx", ["tsx", "server/index.ts"]);
@@ -61,15 +84,14 @@ run("client", "npx", ["vite", "--host", "127.0.0.1"]);
 
 if (!noOpen) {
   setTimeout(() => {
-    open("http://127.0.0.1:5173").catch((error) => {
-      console.error("Could not open browser:", error.message);
-    });
+    openFrontend();
   }, 1400);
 } else {
-  console.log("Browser auto-open disabled. Frontend: http://127.0.0.1:5173 API: http://127.0.0.1:4317");
+  console.log(`Browser auto-open disabled. Frontend: ${frontendUrl} API: ${apiUrl}`);
 }
 
 function shutdown() {
+  shuttingDown = true;
   for (const child of processes) {
     if (!child.killed) {
       child.kill();

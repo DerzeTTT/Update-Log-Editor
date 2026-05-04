@@ -23,7 +23,7 @@ export const aiEditResponseSchema = z.object({
 });
 
 export const settingsSchema = z.object({
-  selectedModelMode: z.enum(["default", "gpt-5.5", "gpt-5.4", "custom"]).default("gpt-5.4"),
+  selectedModelMode: z.enum(["default", "gpt-5.5", "gpt-5.4", "gpt-5.3-codex-spark", "custom"]).default("gpt-5.4"),
   customModel: z.string().default(""),
   characterLimitMode: z.enum(["normal", "nitro", "webhook", "custom"]).default("normal"),
   nitroDefault: z.boolean().default(false),

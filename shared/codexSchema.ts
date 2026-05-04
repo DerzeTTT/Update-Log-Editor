@@ -24,7 +24,7 @@ export const codexOutputJsonSchema = {
                 items: {
                   type: "object",
                   additionalProperties: false,
-                  required: ["text", "children"],
+                  required: ["text", "children", "footers"],
                   properties: {
                     text: { type: "string" },
                     children: {

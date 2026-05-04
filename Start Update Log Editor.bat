@@ -8,4 +8,8 @@ if errorlevel 1 (
   echo.
   echo Update Log Editor failed to start.
   pause
+) else (
+  echo.
+  echo Press any key to close this window.
+  pause >nul
 )
