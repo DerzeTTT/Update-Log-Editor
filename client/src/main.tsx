@@ -625,7 +625,6 @@ function App() {
   }, []);
 
   const splitResult = useMemo(() => {
-    if (sideTab !== "split") return null;
     const settings = settingsQuery.data?.settings;
     return splitDiscordMessages(deferredRawMarkdown, {
       mode: settings?.characterLimitMode ?? "normal",
@@ -634,7 +633,7 @@ function App() {
       title: deferredStructured.title,
       footer: deferredStructured.footer
     });
-  }, [sideTab, deferredRawMarkdown, settingsQuery.data?.settings, deferredStructured.title, deferredStructured.footer]);
+  }, [deferredRawMarkdown, settingsQuery.data?.settings, deferredStructured.title, deferredStructured.footer]);
 
   const toastCopy = async (text: string, label: string) => {
     await copyText(text);
@@ -739,10 +738,10 @@ function App() {
             </div>
             <div className="sideContent">
               <div className={`sideMode ${sideTab === "preview" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "preview"}>
-                {sideTab === "preview" && <Preview rawMarkdown={deferredRawMarkdown} />}
+                {sideTab === "preview" && <Preview rawMarkdown={deferredRawMarkdown} splitResult={splitResult} />}
               </div>
               <div className={`sideMode ${sideTab === "split" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "split"}>
-                {sideTab === "split" && splitResult && <SplitPanel
+                {sideTab === "split" && <SplitPanel
                   result={splitResult}
                   onCopy={toastCopy}
                   rawMarkdown={deferredRawMarkdown}
@@ -754,7 +753,7 @@ function App() {
                 />}
               </div>
               <div className={`sideMode ${sideTab === "ai" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "ai"}>
-                {sideTab === "ai" && activeDraft && <AiPanel draftId={activeDraft.id} rawMarkdown={rawMarkdown} structured={structured} onApply={updateStructured} />}
+                {activeDraft && <AiPanel draftId={activeDraft.id} rawMarkdown={rawMarkdown} structured={structured} onApply={updateStructured} />}
               </div>
               <div className={`sideMode ${sideTab === "history" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "history"}>
                 {sideTab === "history" && activeDraft && <HistoryPanel draftId={activeDraft.id} />}
@@ -1252,8 +1251,16 @@ const StructuredEditor = React.memo(function StructuredEditor({
   );
 });
 
-const Preview = React.memo(function Preview({ rawMarkdown }: { rawMarkdown: string }) {
+const Preview = React.memo(function Preview({
+  rawMarkdown,
+  splitResult
+}: {
+  rawMarkdown: string;
+  splitResult: ReturnType<typeof splitDiscordMessages>;
+}) {
   const [mode, setMode] = useState<"desktop" | "mobile" | "raw">("desktop");
+  const previewTime = useMemo(() => new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }), []);
+  const parts = splitResult.chunks.length > 0 ? splitResult.chunks : [rawMarkdown];
 
   return (
     <div className="previewWrap">
@@ -1266,25 +1273,28 @@ const Preview = React.memo(function Preview({ rawMarkdown }: { rawMarkdown: stri
             <button className={mode === "raw" ? "active" : ""} onClick={() => setMode("raw")}>Raw</button>
           </div>
         </div>
-        <span>{rawMarkdown.length.toLocaleString()} characters</span>
+        <span>{rawMarkdown.length.toLocaleString()} chars, {parts.length} message{parts.length === 1 ? "" : "s"}</span>
       </div>
       {mode === "raw" ? (
         <textarea readOnly value={rawMarkdown} className="rawExport standalone" />
       ) : (
         <div className={mode === "mobile" ? "discordSurface mobileMode" : "discordSurface"}>
           <div className="discordChannelHeader"># update-log</div>
-          <div className="discordMessage">
-            <img className="discordAvatar" src="/bird-profile.png" alt="Bird profile" />
-            <div className="discordMessageBody">
-              <div className="discordMeta">
-                <strong>Bird</strong>
-                <span>Today at {new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}</span>
+          {parts.map((part, index) => (
+            <div className="discordMessage" key={`${index}-${part.length}`}>
+              <img className="discordAvatar" src="/bird-profile.png" alt="Bird profile" />
+              <div className="discordMessageBody">
+                <div className="discordMeta">
+                  <strong>Bird</strong>
+                  <span>Today at {previewTime}{parts.length > 1 ? `, part ${index + 1}/${parts.length}` : ""}</span>
+                </div>
+                <div className="discordPreview"><DiscordMarkdown raw={part} /></div>
               </div>
-              <div className="discordPreview"><DiscordMarkdown raw={rawMarkdown} /></div>
             </div>
-          </div>
+          ))}
         </div>
       )}
+      {splitResult.warnings.map((warning) => <div className="warning" key={warning}>{warning}</div>)}
     </div>
   );
 });
@@ -1439,7 +1449,7 @@ const SplitPanel = React.memo(function SplitPanel({
           <strong>Part headers</strong>
           <small>
             {splitIntoMultipleParts
-              ? "Adds big PART 1/2 headings to each split Discord message."
+              ? `Adds big PART 1/${result.chunks.length} headings to each split Discord message.`
               : "Ready to add PART headings only if this log becomes more than one message."}
           </small>
         </span>
@@ -1488,9 +1498,24 @@ function AiPanel({ draftId, rawMarkdown, structured, onApply }: { draftId: strin
         model: modelMode === "custom" ? customModel : modelMode
       })
     }),
+    onMutate: () => {
+      setProposal(null);
+    },
     onSuccess: setProposal
   });
   const diff = proposal ? diffLines(rawMarkdown, proposal.updatedMarkdown) : [];
+  const updateInstruction = (value: string) => {
+    setInstruction(value);
+    setProposal(null);
+  };
+  const updateModelMode = (value: string) => {
+    setModelMode(value);
+    setProposal(null);
+  };
+  const updateCustomModel = (value: string) => {
+    setCustomModel(value);
+    setProposal(null);
+  };
 
   return (
     <div className="aiPanel">
@@ -1503,11 +1528,11 @@ function AiPanel({ draftId, rawMarkdown, structured, onApply }: { draftId: strin
       </div>
       <div className="aiComposer">
         <label>Instruction
-          <textarea value={instruction} onChange={(event) => setInstruction(event.target.value)} placeholder="Polish this log, shorten a section, reorganize bullets, or apply notes without inventing changes." />
+          <textarea value={instruction} onChange={(event) => updateInstruction(event.target.value)} placeholder="Polish this log, shorten a section, reorganize bullets, or apply notes without inventing changes." />
         </label>
         <div className="modelGrid">
-          <CustomSelect label="Model" value={modelMode} options={modelOptions} onChange={setModelMode} />
-          {modelMode === "custom" && <label>Custom<input value={customModel} onChange={(event) => setCustomModel(event.target.value)} placeholder="model-name" /></label>}
+          <CustomSelect label="Model" value={modelMode} options={modelOptions} onChange={updateModelMode} />
+          {modelMode === "custom" && <label>Custom<input value={customModel} onChange={(event) => updateCustomModel(event.target.value)} placeholder="model-name" /></label>}
         </div>
         <button className="primary askButton" disabled={!instruction || mutation.isPending} onClick={() => mutation.mutate()}>
           <Bot size={16} /> {mutation.isPending ? "Asking Codex..." : "Ask Codex"}
@@ -1533,7 +1558,10 @@ function AiPanel({ draftId, rawMarkdown, structured, onApply }: { draftId: strin
             {diff.map((part, index) => <pre key={index} className={part.added ? "added" : part.removed ? "removed" : ""}>{part.value}</pre>)}
           </div>
           <div className="proposalActions">
-            <button className="primary" onClick={() => onApply(proposal.updatedLog)}><Check size={15} /> Apply</button>
+            <button className="primary" onClick={() => {
+              onApply(proposal.updatedLog);
+              setProposal(null);
+            }}><Check size={15} /> Apply</button>
             <button onClick={() => setProposal(null)}><X size={15} /> Reject</button>
             <button onClick={() => mutation.mutate()}><RefreshCw size={15} /> Regenerate</button>
           </div>

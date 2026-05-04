@@ -24,6 +24,21 @@ describe("Discord splitter", () => {
     expect(result.chunks[1]).toContain("## Title, PART 2/");
   });
 
+  it("supports continuation headers across more than two parts", () => {
+    const bullets = Array.from({ length: 6 }, (_, index) => `- ${index + 1} ${"x".repeat(80)}`).join("\n");
+    const result = splitDiscordMessages(`## Title\n\n### A\n${bullets}`, {
+      mode: "custom",
+      customLimit: 120,
+      title: "Title",
+      continuationHeaders: true
+    });
+
+    expect(result.chunks.length).toBeGreaterThan(2);
+    for (const [index, chunk] of result.chunks.entries()) {
+      expect(chunk).toContain(`## Title, PART ${index + 1}/${result.chunks.length}`);
+    }
+  });
+
   it("does not add continuation headers when the log is not split", () => {
     const result = splitDiscordMessages("## Title\n\n### A\n- Small", { mode: "normal", title: "Title", continuationHeaders: true });
     expect(result.chunks).toHaveLength(1);
