@@ -371,6 +371,13 @@ function RawMarkdownEditor({
         lineHeight: 22,
         tabSize: 2,
         automaticLayout: isActive,
+        quickSuggestions: false,
+        suggestOnTriggerCharacters: false,
+        acceptSuggestionOnEnter: "off",
+        tabCompletion: "off",
+        wordBasedSuggestions: "off",
+        parameterHints: { enabled: false },
+        inlineSuggest: { enabled: false },
         padding: { top: 10, bottom: 18 },
         unicodeHighlight: {
           ambiguousCharacters: false,
