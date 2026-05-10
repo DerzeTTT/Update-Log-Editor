@@ -34,18 +34,30 @@ import {
 import { parseUpdateLog, serializeUpdateLog } from "../shared/markdown";
 import { splitDiscordMessages } from "../shared/splitter";
 import { customEmojiSchema, settingsSchema, updateLogSchema } from "../shared/types";
-import { getCodexStatus, runCodexEdit, updateCodexCli, validateModelName } from "./codex";
+import { getCodexStatus, runCodexEdit, runCodexPrompt, updateCodexCli, validateModelName } from "./codex";
 
 const app = express();
 const port = Number(process.env.PORT ?? 4317);
 const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
 const customEmojiDir = join(rootDir, "data", "custom-emojis");
+const launcherSessionId = process.env.UPDATE_LOG_LAUNCHER_SESSION ?? "";
+const launcherCloseOnLastTab = process.env.UPDATE_LOG_CLOSE_ON_LAST_TAB === "1" && launcherSessionId.length > 0;
+const launcherHeartbeatIntervalMs = 3000;
+const launcherStaleTabMs = 15_000;
+const launcherCloseGraceMs = 4500;
 const allowedEmojiMimeTypes = new Map([
   ["image/png", "png"],
   ["image/jpeg", "jpg"],
   ["image/gif", "gif"],
   ["image/webp", "webp"]
 ]);
+const launcherTabSchema = z.object({
+  sessionId: z.string(),
+  tabId: z.string().min(1).max(200)
+});
+const launcherTabs = new Map<string, { lastSeen: number }>();
+let launcherSawTab = false;
+let launcherShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 
 initDb();
 mkdirSync(customEmojiDir, { recursive: true });
@@ -55,6 +67,74 @@ app.use("/api/custom-emojis", express.static(customEmojiDir));
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
+});
+
+function pruneLauncherTabs(now = Date.now()) {
+  for (const [tabId, tab] of launcherTabs) {
+    if (now - tab.lastSeen > launcherStaleTabMs) launcherTabs.delete(tabId);
+  }
+}
+
+function cancelLauncherShutdown() {
+  if (!launcherShutdownTimer) return;
+  clearTimeout(launcherShutdownTimer);
+  launcherShutdownTimer = null;
+}
+
+function scheduleLauncherShutdown(reason: string) {
+  if (!launcherCloseOnLastTab || !launcherSawTab || launcherShutdownTimer) return;
+  pruneLauncherTabs();
+  if (launcherTabs.size > 0) return;
+  console.log(`No launcher browser tabs remain (${reason}); shutting down in ${launcherCloseGraceMs}ms.`);
+  launcherShutdownTimer = setTimeout(() => {
+    launcherShutdownTimer = null;
+    pruneLauncherTabs();
+    if (launcherTabs.size > 0) return;
+    console.log("Launcher browser tab closed; stopping API.");
+    process.exit(0);
+  }, launcherCloseGraceMs);
+  launcherShutdownTimer.unref();
+}
+
+function recordLauncherTab(tabId: string) {
+  launcherSawTab = true;
+  launcherTabs.set(tabId, { lastSeen: Date.now() });
+  cancelLauncherShutdown();
+}
+
+if (launcherCloseOnLastTab) {
+  const staleTabInterval = setInterval(() => scheduleLauncherShutdown("stale heartbeat"), launcherHeartbeatIntervalMs);
+  staleTabInterval.unref();
+}
+
+app.get("/api/launcher/session", (_req, res) => {
+  res.json({
+    closeOnLastTab: launcherCloseOnLastTab,
+    sessionId: launcherCloseOnLastTab ? launcherSessionId : undefined,
+    heartbeatIntervalMs: launcherHeartbeatIntervalMs
+  });
+});
+
+app.post("/api/launcher/tabs/:event", (req, res) => {
+  if (!launcherCloseOnLastTab) {
+    res.status(204).send();
+    return;
+  }
+  const event = z.enum(["open", "heartbeat", "close"]).parse(req.params.event);
+  const body = launcherTabSchema.parse(req.body);
+  if (body.sessionId !== launcherSessionId) {
+    res.status(403).json({ error: "Invalid launcher session." });
+    return;
+  }
+  if (event === "close") {
+    launcherSawTab = true;
+    launcherTabs.delete(body.tabId);
+    scheduleLauncherShutdown("tab close");
+    res.status(204).send();
+    return;
+  }
+  recordLauncherTab(body.tabId);
+  res.status(204).send();
 });
 
 app.get("/api/drafts", (_req, res) => {
@@ -291,6 +371,86 @@ app.post("/api/codex/update", async (_req, res) => {
   } catch (error) {
     const message = error instanceof Error ? error.message : "Codex update failed.";
     res.status(502).json({ error: message.slice(0, 4000) });
+  }
+});
+
+function buildPromptWithDraftContext(input: { prompt: string; draft: ReturnType<typeof retrieveDrafts>["matches"][number] }) {
+  return `You are helping with a local Roblox Discord update log in Update Log Editor.
+
+Answer the user's request using the current draft context below. If the user asks for an edit, describe the edit or return the requested structured output; do not claim you changed the draft unless a separate API call applies it.
+
+User request:
+${input.prompt}
+
+Draft metadata:
+${JSON.stringify({
+  draftId: input.draft.draftId,
+  draftName: input.draft.draftName,
+  source: input.draft.source,
+  matchedAt: input.draft.matchedAt,
+  filePath: input.draft.filePath,
+  rawLength: input.draft.rawLength
+}, null, 2)}
+
+Current structured draft JSON:
+${JSON.stringify(input.draft.structured, null, 2)}
+
+Current raw Markdown:
+${input.draft.rawMarkdown}`;
+}
+
+app.post("/api/codex/prompt", async (req, res) => {
+  try {
+    const body = z.object({
+      prompt: z.string().min(1).max(120_000),
+      model: z.string().optional(),
+      responseFormat: z.enum(["text", "json"]).optional(),
+      outputSchema: z.unknown().optional(),
+      timeoutMs: z.number().int().min(10_000).max(600_000).default(180_000),
+      includeDraft: z.boolean().default(false),
+      draftId: z.string().optional()
+    }).parse(req.body);
+    const model = body.model && body.model !== "default" ? body.model : undefined;
+    if (model && !validateModelName(model)) {
+      return res.status(400).json({ error: "Invalid model name." });
+    }
+    if (body.outputSchema !== undefined && (!body.outputSchema || typeof body.outputSchema !== "object" || Array.isArray(body.outputSchema))) {
+      return res.status(400).json({ error: "outputSchema must be a JSON object." });
+    }
+
+    const retrieval = body.includeDraft || body.draftId
+      ? retrieveDrafts({ draftId: body.draftId, source: "current", limit: 1 })
+      : undefined;
+    const draft = retrieval?.matches[0];
+    if ((body.includeDraft || body.draftId) && !draft) {
+      return res.status(404).json({ error: "Draft not found." });
+    }
+
+    const prompt = draft ? buildPromptWithDraftContext({ prompt: body.prompt, draft }) : body.prompt;
+    const result = await runCodexPrompt({
+      prompt,
+      model,
+      responseFormat: body.responseFormat,
+      outputSchema: body.outputSchema,
+      timeoutMs: body.timeoutMs
+    });
+    res.json({
+      ...result,
+      draft: draft ? {
+        draftId: draft.draftId,
+        draftName: draft.draftName,
+        matchedAt: draft.matchedAt,
+        rawLength: draft.rawLength,
+        filePath: draft.filePath
+      } : undefined
+    });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      res.status(400).json({ error: error.issues.map((issue) => `${issue.path.join(".") || "body"}: ${issue.message}`).join("; ").slice(0, 4000) });
+      return;
+    }
+    const message = error instanceof Error ? error.message : "Codex prompt failed.";
+    res.status(message.includes("Invalid model") || message.includes("schema") ? 400 : 502).json({ error: message.slice(0, 4000) });
   }
 });
 

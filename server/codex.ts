@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
@@ -23,6 +24,16 @@ type CodexStatusOptions = {
 };
 
 type CodexStatus = Awaited<ReturnType<typeof buildCodexStatus>>;
+
+type CodexPromptFormat = "text" | "json";
+
+type CodexPromptInput = {
+  prompt: string;
+  model?: string;
+  responseFormat?: CodexPromptFormat;
+  outputSchema?: unknown;
+  timeoutMs?: number;
+};
 
 const statusCache = new Map<string, { status: CodexStatus; expiresAtMs: number }>();
 const fastStatusTtlMs = 60_000;
@@ -238,7 +249,7 @@ export async function updateCodexCli() {
   };
 }
 
-export function extractFinalJson(stdout: string): unknown {
+export function extractFinalMessage(stdout: string): string {
   let lastMessage = "";
   let lastNonEventLine = "";
   for (const line of stdout.split(/\r?\n/)) {
@@ -268,12 +279,58 @@ export function extractFinalJson(stdout: string): unknown {
   if (!trimmed) {
     throw new Error("Codex returned no assistant message.");
   }
+  return trimmed;
+}
+
+function parseJsonMessage(trimmed: string): unknown {
   try {
     return JSON.parse(trimmed);
   } catch {
     const match = trimmed.match(/\{[\s\S]*\}$/);
     if (match) return JSON.parse(match[0]);
     throw new Error("Codex returned malformed JSON.");
+  }
+}
+
+export function extractFinalJson(stdout: string): unknown {
+  return parseJsonMessage(extractFinalMessage(stdout));
+}
+
+export async function runCodexPrompt(input: CodexPromptInput) {
+  const args = ["-a", "never", "exec", "--sandbox", "read-only", "--json"];
+  let schemaFilePath = "";
+  if (input.model) {
+    if (!validateModelName(input.model)) {
+      throw new Error("Invalid model name.");
+    }
+    args.push("-m", input.model);
+  }
+  if (input.outputSchema !== undefined) {
+    const serializedSchema = JSON.stringify(input.outputSchema);
+    if (!serializedSchema || serializedSchema.length > 200_000) {
+      throw new Error("Output schema is too large or invalid.");
+    }
+    mkdirSync(schemaDir, { recursive: true });
+    schemaFilePath = join(schemaDir, `codex-prompt-schema-${randomUUID()}.json`);
+    writeFileSync(schemaFilePath, serializedSchema, "utf8");
+    args.push("--output-schema", schemaFilePath);
+  }
+  args.push("-");
+
+  try {
+    const result = await runCommand("codex", args, input.prompt, input.timeoutMs ?? 180000);
+    if (result.code !== 0) {
+      throw new Error(sanitize(result.stderr || result.stdout || `Codex exited with code ${result.code}.`));
+    }
+    const message = extractFinalMessage(result.stdout);
+    const responseFormat = input.responseFormat ?? (input.outputSchema !== undefined ? "json" : "text");
+    return {
+      message,
+      json: responseFormat === "json" ? parseJsonMessage(message) : undefined,
+      model: input.model ?? "Codex default"
+    };
+  } finally {
+    if (schemaFilePath) rmSync(schemaFilePath, { force: true });
   }
 }
 

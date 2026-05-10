@@ -30,7 +30,7 @@ npm start
 http://127.0.0.1:5173
 ```
 
-Leave the terminal running while you use the editor. Closing it stops both the API server and the Vite frontend.
+With the normal `npm start` command, the editor opens in your browser and the API server plus Vite frontend stop automatically after you close the editor tab. Closing the terminal still stops both processes immediately.
 
 For normal desktop use on this machine, you can also double-click:
 
@@ -38,7 +38,7 @@ For normal desktop use on this machine, you can also double-click:
 Start Update Log Editor.bat
 ```
 
-If browser auto-open fails or you want to open the page yourself:
+If browser auto-open fails, you want to open the page yourself, or you want the server to keep running after browser tabs close:
 
 ```powershell
 npm run start:headless
@@ -84,15 +84,33 @@ Codex can retrieve drafts and saved versions through the local API:
 GET /api/codex/drafts/retrieve?when=yesterday&q=heian
 GET /api/codex/drafts/retrieve?when=2026-05-10&source=versions&limit=5
 POST /api/codex/drafts/restore
+POST /api/codex/prompt
 ```
 
 `when` accepts `today`, `yesterday`, or `YYYY-MM-DD`. Retrieval responses include full Markdown and structured data for each match so Codex can recover or inspect an older draft directly.
 
+`POST /api/codex/prompt` sends a read-only prompt to the Codex CLI. The body supports:
+
+```json
+{
+  "prompt": "Tell me what the current draft looks like.",
+  "model": "gpt-5.4",
+  "includeDraft": true,
+  "draftId": "optional-draft-id",
+  "responseFormat": "text",
+  "timeoutMs": 180000
+}
+```
+
+Set `responseFormat` to `json` and pass `outputSchema` when you want Codex to return schema-checked JSON. Use `/api/codex/edit` for proposed update-log edits, `/api/codex/intake` for direct bullet additions, and `PUT /api/drafts/:id` to apply a full Markdown update.
+
 ## Useful Commands
 
 ```powershell
-npm start              # start API + frontend and open the browser
-npm run start:headless # start API + frontend without browser auto-open
+npm start              # start API + frontend, open the browser, stop when the editor tab closes
+npm run start:headless # start API + frontend without browser auto-open or tab-close shutdown
 npm run build          # type-check and build the frontend
 npm test               # run the Vitest test suite
 ```
+
+Headless mode keeps running until the terminal process is stopped. When automation starts it in the background, record the process ID and stop that process tree when finished; on Windows, `taskkill /PID <pid> /T /F` stops the server and Vite child processes.

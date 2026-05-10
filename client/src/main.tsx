@@ -47,6 +47,7 @@ type VersionsResponse = { versions: VersionSummary[] };
 type VersionResponse = { version: VersionRecord };
 type SaveVersionResponse = { version: VersionSummary | null; draft: DraftRecord };
 type DraftBackupsResponse = { backupDir: string; latestBackupPath: string; backups: DraftBackupSummary[] };
+type LauncherSessionResponse = { closeOnLastTab: boolean; sessionId?: string; heartbeatIntervalMs?: number };
 type SelectOption = { value: string; label: string; meta?: string };
 type EditorTab = "raw" | "structured";
 type SideTab = "preview" | "emojis" | "split" | "ai" | "history" | "settings";
@@ -81,6 +82,7 @@ type BulletDragLocation = { sectionIndex: number; sectionUiId: string; itemIndex
 type BulletDropTarget = { sectionIndex: number; sectionUiId: string; itemIndex: number; itemUiId?: string; side: "before" | "after" };
 type SectionDragLocation = { sectionIndex: number; sectionUiId: string };
 type SectionDropTarget = SectionDragLocation & { side: "before" | "after" };
+type LauncherLifecycleWindow = typeof window & { __updateLogEditorLauncherLifecycleStarted?: boolean };
 type BulletDragSession = {
   source: BulletDragLocation;
   element: HTMLElement;
@@ -126,6 +128,8 @@ const markdownWorkerDebounceMs = 120;
 const recoveryStorageKey = "update-log-editor.recovery.v1";
 const recoveryFreshnessToleranceMs = 500;
 const maxRecoveryDrafts = 30;
+const launcherSessionRetryDelayMs = 500;
+const launcherSessionMaxAttempts = 40;
 const emptySplitResult: SplitResult = { chunks: [], limit: 2000, totalCharacters: 0, warnings: [] };
 const codexStatusQueryOptions = {
   staleTime: 60_000,
@@ -332,6 +336,63 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
+}
+
+function createBrowserTabId(): string {
+  return globalThis.crypto?.randomUUID?.() ?? `tab-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+function sendLauncherTabEvent(event: "open" | "heartbeat" | "close", sessionId: string, tabId: string, useBeacon = false) {
+  const body = JSON.stringify({ sessionId, tabId });
+  const url = `/api/launcher/tabs/${event}`;
+  if (useBeacon && typeof navigator !== "undefined" && navigator.sendBeacon) {
+    navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
+    return;
+  }
+  void fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    keepalive: useBeacon
+  }).catch(() => undefined);
+}
+
+function startLauncherLifecycle() {
+  if (typeof window === "undefined") return;
+  const lifecycleWindow = window as LauncherLifecycleWindow;
+  if (lifecycleWindow.__updateLogEditorLauncherLifecycleStarted) return;
+  lifecycleWindow.__updateLogEditorLauncherLifecycleStarted = true;
+  const tabId = createBrowserTabId();
+  const connect = (attempt: number) => {
+    void fetch("/api/launcher/session")
+      .then((response) => response.ok ? response.json() as Promise<LauncherSessionResponse> : null)
+      .then((session) => {
+        if (!session) {
+          if (attempt < launcherSessionMaxAttempts) window.setTimeout(() => connect(attempt + 1), launcherSessionRetryDelayMs);
+          return;
+        }
+        if (!session.closeOnLastTab || !session.sessionId) return;
+        const heartbeatIntervalMs = Math.max(1000, session.heartbeatIntervalMs ?? 3000);
+        let closed = false;
+        let heartbeatId = 0;
+        const closeTab = () => {
+          if (closed) return;
+          closed = true;
+          window.clearInterval(heartbeatId);
+          sendLauncherTabEvent("close", session.sessionId!, tabId, true);
+        };
+        heartbeatId = window.setInterval(() => {
+          sendLauncherTabEvent("heartbeat", session.sessionId!, tabId);
+        }, heartbeatIntervalMs);
+        sendLauncherTabEvent("open", session.sessionId, tabId);
+        window.addEventListener("pagehide", closeTab, { once: true });
+        window.addEventListener("beforeunload", closeTab, { once: true });
+      })
+      .catch(() => {
+        if (attempt < launcherSessionMaxAttempts) window.setTimeout(() => connect(attempt + 1), launcherSessionRetryDelayMs);
+      });
+  };
+  connect(1);
 }
 
 function readRecoveryStore(): DraftRecoveryStore {
@@ -3448,6 +3509,7 @@ function StatusRow({
 }
 
 const rootElement = document.getElementById("root")!;
+startLauncherLifecycle();
 const hotWindow = window as typeof window & { __updateLogEditorRoot?: ReturnType<typeof createRoot> };
 hotWindow.__updateLogEditorRoot ??= createRoot(rootElement);
 hotWindow.__updateLogEditorRoot.render(

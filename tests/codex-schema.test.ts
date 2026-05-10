@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { extractFinalJson } from "../server/codex";
+import { extractFinalJson, extractFinalMessage } from "../server/codex";
 import { codexOutputJsonSchema } from "../shared/codexSchema";
 import { aiEditResponseSchema, settingsSchema } from "../shared/types";
 
@@ -93,5 +93,21 @@ describe("AI response schema", () => {
     ].join("\n"));
 
     expect(aiEditResponseSchema.parse(parsed).summary).toBe("Added responsiveness note.");
+  });
+
+  it("extracts a plain final Codex message for prompt responses", () => {
+    const message = extractFinalMessage([
+      JSON.stringify({ type: "thread.started", thread_id: "test" }),
+      JSON.stringify({
+        type: "item.completed",
+        item: {
+          type: "agent_message",
+          text: "Current draft has 2 sections and a Discord footer."
+        }
+      }),
+      "SUCCESS: The process with PID 123 has been terminated."
+    ].join("\n"));
+
+    expect(message).toBe("Current draft has 2 sections and a Discord footer.");
   });
 });

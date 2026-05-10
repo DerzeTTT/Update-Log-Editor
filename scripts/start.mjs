@@ -1,11 +1,18 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import net from "node:net";
 import open from "open";
 
 const processes = [];
-const env = { ...process.env, FORCE_COLOR: "1" };
 const args = new Set(process.argv.slice(2));
 const noOpen = args.has("--no-open") || args.has("--headless") || process.env.UPDATE_LOG_NO_OPEN === "1";
+const launcherSession = noOpen ? "" : randomUUID();
+const env = {
+  ...process.env,
+  FORCE_COLOR: "1",
+  UPDATE_LOG_CLOSE_ON_LAST_TAB: noOpen ? "0" : "1",
+  UPDATE_LOG_LAUNCHER_SESSION: launcherSession
+};
 const frontendUrl = "http://127.0.0.1:5173";
 const apiUrl = "http://127.0.0.1:4317";
 let shuttingDown = false;
@@ -30,18 +37,22 @@ function run(name, command, args) {
   const child = spawn(command, args, {
     cwd: process.cwd(),
     env,
-    shell: process.platform === "win32",
     stdio: "inherit"
   });
   processes.push(child);
-  child.on("exit", (code) => {
+  child.on("exit", async (code) => {
     if (shuttingDown || exitingAfterFailure) {
       return;
+    }
+    if (!noOpen && name === "server" && code === 0) {
+      console.log("Browser tab closed; stopping Update Log Editor.");
+      await shutdown();
+      process.exit(0);
     }
     const exitCode = typeof code === "number" && code !== 0 ? code : 1;
     console.error(`${name} exited unexpectedly${code === null ? "" : ` with code ${code}`}.`);
     exitingAfterFailure = true;
-    shutdown();
+    await shutdown();
     process.exit(exitCode);
   });
   return child;
@@ -79,10 +90,11 @@ if (apiRunning || clientRunning) {
   process.exit(1);
 }
 
-run("server", "npx", ["tsx", "server/index.ts"]);
-run("client", "npx", ["vite", "--host", "127.0.0.1"]);
+run("server", process.execPath, ["node_modules/tsx/dist/cli.mjs", "server/index.ts"]);
+run("client", process.execPath, ["node_modules/vite/bin/vite.js", "--host", "127.0.0.1"]);
 
 if (!noOpen) {
+  console.log("Close the browser tab to stop Update Log Editor automatically.");
   setTimeout(() => {
     openFrontend();
   }, 1400);
@@ -90,20 +102,43 @@ if (!noOpen) {
   console.log(`Browser auto-open disabled. Frontend: ${frontendUrl} API: ${apiUrl}`);
 }
 
-function shutdown() {
-  shuttingDown = true;
-  for (const child of processes) {
-    if (!child.killed) {
-      child.kill();
-    }
+function stopChild(child) {
+  if (child.killed || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
   }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    child.once("exit", finish);
+    setTimeout(finish, 2500).unref();
+    if (process.platform === "win32" && child.pid) {
+      const killer = spawn("taskkill", ["/pid", String(child.pid), "/t", "/f"], {
+        stdio: "ignore",
+        windowsHide: true
+      });
+      killer.once("error", () => {
+        if (!child.killed) child.kill();
+      });
+      return;
+    }
+    child.kill();
+  });
 }
 
-process.on("SIGINT", () => {
-  shutdown();
+async function shutdown() {
+  shuttingDown = true;
+  await Promise.all(processes.map((child) => stopChild(child)));
+}
+
+process.on("SIGINT", async () => {
+  await shutdown();
   process.exit(0);
 });
-process.on("SIGTERM", () => {
-  shutdown();
+process.on("SIGTERM", async () => {
+  await shutdown();
   process.exit(0);
 });
