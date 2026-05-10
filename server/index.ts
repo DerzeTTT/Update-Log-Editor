@@ -1,4 +1,8 @@
 import express from "express";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
   appendCodexIntake,
@@ -22,15 +26,25 @@ import {
 } from "./db";
 import { parseUpdateLog, serializeUpdateLog } from "../shared/markdown";
 import { splitDiscordMessages } from "../shared/splitter";
-import { settingsSchema, updateLogSchema } from "../shared/types";
+import { customEmojiSchema, settingsSchema, updateLogSchema } from "../shared/types";
 import { getCodexStatus, runCodexEdit, updateCodexCli, validateModelName } from "./codex";
 
 const app = express();
 const port = Number(process.env.PORT ?? 4317);
+const rootDir = dirname(dirname(fileURLToPath(import.meta.url)));
+const customEmojiDir = join(rootDir, "data", "custom-emojis");
+const allowedEmojiMimeTypes = new Map([
+  ["image/png", "png"],
+  ["image/jpeg", "jpg"],
+  ["image/gif", "gif"],
+  ["image/webp", "webp"]
+]);
 
 initDb();
+mkdirSync(customEmojiDir, { recursive: true });
 
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json({ limit: "8mb" }));
+app.use("/api/custom-emojis", express.static(customEmojiDir));
 
 app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
@@ -151,6 +165,39 @@ app.put("/api/settings", (req, res) => {
   res.json({ settings: saveSettings(settingsSchema.parse(req.body)) });
 });
 
+app.post("/api/emojis/upload", (req, res) => {
+  try {
+    const body = z.object({
+      name: customEmojiSchema.shape.name,
+      mimeType: z.string(),
+      dataUrl: z.string().max(7_500_000)
+    }).parse(req.body);
+    const extension = allowedEmojiMimeTypes.get(body.mimeType);
+    if (!extension) {
+      return res.status(400).json({ error: "Use a PNG, JPG, GIF, or WEBP image." });
+    }
+    const prefix = `data:${body.mimeType};base64,`;
+    if (!body.dataUrl.startsWith(prefix)) {
+      return res.status(400).json({ error: "Invalid emoji image upload." });
+    }
+    const imageBuffer = Buffer.from(body.dataUrl.slice(prefix.length), "base64");
+    if (imageBuffer.length === 0 || imageBuffer.length > 2_000_000) {
+      return res.status(400).json({ error: "Emoji image must be 2 MB or smaller." });
+    }
+    const fileName = `${body.name.toLowerCase()}-${randomUUID()}.${extension}`;
+    writeFileSync(join(customEmojiDir, fileName), imageBuffer);
+    res.status(201).json({
+      emoji: {
+        name: body.name,
+        emoji: `/api/custom-emojis/${fileName}`
+      }
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Emoji upload failed.";
+    res.status(400).json({ error: message.slice(0, 4000) });
+  }
+});
+
 app.get("/api/codex/status", async (_req, res) => {
   const settings = getSettings();
   const selected = settings.selectedModelMode === "custom" ? settings.customModel : settings.selectedModelMode;
@@ -173,6 +220,7 @@ app.post("/api/codex/edit", async (req, res) => {
       rawMarkdown: z.string().max(200_000),
       draft: updateLogSchema,
       instruction: z.string().min(1).max(8000),
+      customEmojis: z.array(customEmojiSchema).default([]),
       model: z.string().optional()
     }).parse(req.body);
     const model = body.model && body.model !== "default" ? body.model : undefined;
@@ -183,6 +231,7 @@ app.post("/api/codex/edit", async (req, res) => {
       draft: body.draft,
       rawMarkdown: body.rawMarkdown,
       instruction: body.instruction,
+      customEmojis: body.customEmojis.length ? body.customEmojis : getSettings().customEmojis,
       model
     });
     recordAiHistory({

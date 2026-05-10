@@ -6,9 +6,11 @@ import { aiEditResponseSchema, settingsSchema } from "../shared/types";
 describe("AI response schema", () => {
   it("accepts GPT-5.3 Spark as a saved model option", () => {
     const parsed = settingsSchema.parse({
-      selectedModelMode: "gpt-5.3-codex-spark"
+      selectedModelMode: "gpt-5.3-codex-spark",
+      customEmojis: [{ name: "Raid", emoji: "\u2694\ufe0f" }]
     });
     expect(parsed.selectedModelMode).toBe("gpt-5.3-codex-spark");
+    expect(parsed.customEmojis[0].name).toBe("Raid");
   });
 
   it("accepts the expected shape", () => {

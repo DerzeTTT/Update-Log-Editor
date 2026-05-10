@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
-import { aiEditResponseSchema, type UpdateLog } from "../shared/types";
+import { aiEditResponseSchema, genericEmojiCatalog, type CustomEmoji, type UpdateLog } from "../shared/types";
 import { codexOutputJsonSchema } from "../shared/codexSchema";
 import { serializeUpdateLog } from "../shared/markdown";
 
@@ -237,6 +237,7 @@ export async function runCodexEdit(input: {
   draft: UpdateLog;
   rawMarkdown: string;
   instruction: string;
+  customEmojis?: CustomEmoji[];
   model?: string;
 }) {
   mkdirSync(schemaDir, { recursive: true });
@@ -251,6 +252,7 @@ export async function runCodexEdit(input: {
   }
   args.push("-");
 
+  const emojiCatalog = formatEmojiCatalog(input.customEmojis ?? []);
   const prompt = `You are editing a Discord game update log. Return valid JSON only, matching the provided schema.
 
 Rules:
@@ -258,13 +260,18 @@ Rules:
 - Do not remove existing content unless explicitly asked.
 - Do not invent game changes.
 - Preserve Discord Markdown.
-- Preserve emoji text exactly as typed.
+- Emoji aliases are Discord-style text tokens, for example :Star: or :Heart:.
+- Use available emoji aliases when the user asks to add emojis. Keep aliases in text as :Name: tokens; the app preview renders them as emoji.
+- Preserve existing unknown emoji aliases exactly as typed.
 - Keep title as ## heading.
 - Keep sections as ### headings.
 - Keep top-level bullets as "- ".
 - Keep nested bullets as two-space indented "- ".
 - Keep the footer at the end unless asked to change it.
 - AI editing must only propose draft changes.
+
+Available emoji aliases:
+${emojiCatalog}
 
 User instruction:
 ${input.instruction}
@@ -287,4 +294,15 @@ Respond with:
     ...parsed,
     updatedMarkdown: serializeUpdateLog(parsed.updatedLog)
   };
+}
+
+function formatEmojiCatalog(customEmojis: CustomEmoji[]): string {
+  const entries = new Map<string, string>();
+  for (const entry of genericEmojiCatalog) {
+    entries.set(entry.name.toLowerCase(), `:${entry.name}: = ${entry.emoji}`);
+  }
+  for (const entry of customEmojis) {
+    entries.set(entry.name.toLowerCase(), `:${entry.name}: = ${entry.emoji}`);
+  }
+  return [...entries.values()].join("\n");
 }

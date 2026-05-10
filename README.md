@@ -1,43 +1,78 @@
 # Update Log Editor
 
-Roblox project for editing and managing update log content.
+A local Roblox update-log editor for drafting Discord-ready patch notes. It gives you raw Markdown editing, a structured section-and-bullet editor, Discord-style preview, message splitting, version history, optional Codex AI edits, and custom emoji tokens.
 
-## Starting the App
+## Easy Setup
 
-The reliable way to start the editor is from this project folder:
+1. Install [Node.js 20 or newer](https://nodejs.org/).
+2. Clone the repo:
 
 ```powershell
-Set-Location -LiteralPath "D:\Update Log Editor"
+git clone https://github.com/DerzeTTT/Update-Log-Editor.git
+Set-Location -LiteralPath ".\Update-Log-Editor"
+```
+
+3. Install dependencies:
+
+```powershell
+npm install
+```
+
+4. Start the app:
+
+```powershell
 npm start
 ```
 
-This starts both the API server and the Vite frontend, then opens:
+5. Open the editor at:
 
 ```text
 http://127.0.0.1:5173
 ```
 
-For normal desktop use, you can also double-click:
+Leave the terminal running while you use the editor. Closing it stops both the API server and the Vite frontend.
+
+For normal desktop use on this machine, you can also double-click:
 
 ```text
 Start Update Log Editor.bat
 ```
 
-If Codex or another tool has trouble opening the browser automatically, start it without auto-open:
+If browser auto-open fails or you want to open the page yourself:
 
 ```powershell
-Set-Location -LiteralPath "D:\Update Log Editor"
 npm run start:headless
 ```
 
-Then open `http://127.0.0.1:5173` manually. Leave the terminal window running while using the editor; closing it stops the app.
+Then open `http://127.0.0.1:5173` manually.
 
-## Direct Markdown Files
+## Using The Editor
 
-The app also mirrors every draft to a plain Markdown file:
+- Write directly in the raw Markdown tab or use the structured editor to manage headings, sections, bullets, nested bullets, and footers.
+- Drag bullet handles in the structured editor to reorder items.
+- Use Preview to see the update log in a Discord-like desktop, mobile, or raw view.
+- Use Emojis to copy built-in tokens such as `:Star:` or upload local custom emoji images. Custom emoji uploads are stored under `data/custom-emojis/`.
+- Use Messages to split a long update log into Discord-sized chunks. The splitter keeps whole categories together when it can and warns when a category is too large for the selected limit.
+- Use History to restore saved versions.
+- Use AI after installing and logging in to the Codex CLI with `npm i -g @openai/codex` and `codex login`.
+
+## Local Drafts And Data
+
+The app mirrors every draft to a plain Markdown file:
 
 ```text
 Drafts/<draft-id>.md
 ```
 
 You can copy the exact path from the app with `Copy .md path`. Codex or any editor can change that file directly. When the backend is running, the app checks for newer file edits and imports them back into SQLite as a `File sync` version. If the backend is closed, start the app again and it will import newer Markdown files on startup.
+
+Drafts and app data are intentionally local. The repo ignores `Drafts/`, `data/`, `dist/`, `node_modules/`, logs, coverage, and temporary files so private drafts, SQLite databases, generated builds, and uploaded emoji images do not get pushed.
+
+## Useful Commands
+
+```powershell
+npm start              # start API + frontend and open the browser
+npm run start:headless # start API + frontend without browser auto-open
+npm run build          # type-check and build the frontend
+npm test               # run the Vitest test suite
+```

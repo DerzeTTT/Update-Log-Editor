@@ -23,6 +23,7 @@ function splitIntoUnits(raw: string, footer?: string): { body: string[]; footerT
 
   const units: string[] = [];
   let current: string[] = [];
+  let currentContainsSection = false;
   let inCode = false;
   let inSpoilerBlock = false;
 
@@ -31,18 +32,19 @@ function splitIntoUnits(raw: string, footer?: string): { body: string[]; footerT
     if (current.length > 0) {
       units.push(current.join("\n"));
       current = [];
+      currentContainsSection = false;
     }
   };
 
   for (const line of lines) {
     const trimmed = line.trim();
-    const startsBoundary = line.startsWith("### ") || (line.startsWith("- ") && current.some((entry) => entry.startsWith("- ")));
     const startsSection = line.startsWith("### ");
-    if (!inCode && !inSpoilerBlock && (startsSection || startsBoundary)) {
+    if (!inCode && !inSpoilerBlock && startsSection && currentContainsSection) {
       flush();
     }
 
     current.push(line);
+    if (startsSection) currentContainsSection = true;
     if (trimmed.startsWith("```")) inCode = !inCode;
     if (trimmed.startsWith("||") && !trimmed.endsWith("||")) inSpoilerBlock = true;
     if (inSpoilerBlock && trimmed.endsWith("||")) inSpoilerBlock = false;
@@ -58,7 +60,8 @@ function appendChunk(chunks: string[], text: string) {
 }
 
 function withPartHeader(chunk: string, title: string, index: number, total: number): string {
-  const header = `## ${title}, PART ${index + 1}/${total}`;
+  const partLabel = `PART ${index + 1}/${total}`;
+  const header = index === 0 ? `## ${title}, ${partLabel}` : `## ${partLabel}`;
   const lines = chunk.split("\n");
   if (lines[0]?.startsWith("## ") && !lines[0].startsWith("### ")) {
     return [header, ...lines.slice(1)].join("\n").trim();
@@ -89,25 +92,7 @@ export function splitDiscordMessages(markdown: string, options: SplitOptions): S
       return;
     }
 
-    const lines = unit.split("\n");
-    let lineBuffer = "";
-    let inCode = false;
-    for (const line of lines) {
-      const candidateLine = lineBuffer ? `${lineBuffer}\n${line}` : line;
-      if (candidateLine.length > limit && lineBuffer) {
-        let chunk = lineBuffer;
-        if (inCode && !chunk.endsWith("```")) chunk += "\n```";
-        appendChunk(chunks, chunk);
-        lineBuffer = inCode ? `\`\`\`\n${line}` : line;
-      } else {
-        lineBuffer = candidateLine;
-      }
-      if (line.trim().startsWith("```")) inCode = !inCode;
-    }
-    if (lineBuffer.length > limit) {
-      warnings.push("A single line exceeds the selected character limit.");
-    }
-    current = lineBuffer;
+    current = unit;
   };
 
   for (const unit of body) {

@@ -24,25 +24,43 @@ import {
   RefreshCw,
   Save,
   Settings,
+  SmilePlus,
   Trash2,
   X
 } from "lucide-react";
 import { cloneLog, parseUpdateLog, serializeUpdateLog } from "../../shared/markdown";
 import { splitDiscordMessages } from "../../shared/splitter";
-import type { AiEditResponse, AppSettings, DraftRecord, LogItem, UpdateLog, VersionRecord } from "../../shared/types";
+import { genericEmojiCatalog, type AiEditResponse, type AppSettings, type CustomEmoji, type DraftRecord, type LogItem, type UpdateLog, type VersionRecord } from "../../shared/types";
 import "./styles.css";
 
 type DraftsResponse = { drafts: DraftRecord[] };
 type DraftResponse = { draft: DraftRecord };
 type SettingsResponse = { settings: AppSettings };
+type UploadEmojiResponse = { emoji: CustomEmoji };
 type VersionsResponse = { versions: VersionRecord[] };
 type SaveVersionResponse = { version: VersionRecord; draft: DraftRecord };
 type SelectOption = { value: string; label: string; meta?: string };
 type EditorTab = "raw" | "structured";
-type SideTab = "preview" | "split" | "ai" | "history" | "settings";
+type SideTab = "preview" | "emojis" | "split" | "ai" | "history" | "settings";
 type SlideDirection = "slideForward" | "slideBack";
 type BulletDragLocation = { sectionIndex: number; itemIndex: number };
 type BulletDropTarget = BulletDragLocation & { side: "before" | "after" };
+type BulletDragSession = {
+  source: BulletDragLocation;
+  element: HTMLElement;
+  pointerId: number;
+  pointerStartY: number;
+  scrollStartTop: number;
+  pointerX: number;
+  pointerY: number;
+  target: BulletDropTarget | null;
+  targetElement: HTMLElement | null;
+  rafId: number | null;
+  autoScrollRafId: number | null;
+  onPointerMove: (event: PointerEvent) => void;
+  onPointerUp: (event: PointerEvent) => void;
+  onPointerCancel: (event: PointerEvent) => void;
+};
 type AmbientGlow = {
   id: number;
   color: string;
@@ -56,15 +74,91 @@ type AmbientGlow = {
 const sectionMenuOptionsLimit = 12;
 const everyoneFooter = "-# ||@everyone||";
 const editorTabOrder: EditorTab[] = ["raw", "structured"];
-const sideTabOrder: SideTab[] = ["preview", "split", "ai", "history", "settings"];
+const sideTabOrder: SideTab[] = ["preview", "emojis", "split", "ai", "history", "settings"];
 const markdownInputCommitDelayMs = 650;
 const rawParseDebounceMs = 360;
 const codexStatusQueryOptions = {
   staleTime: 30_000,
   refetchOnWindowFocus: false
 };
+const emojiAliasPattern = /:([A-Za-z0-9_+-]{1,64}):/g;
 
 const queryClient = new QueryClient();
+
+type EmojiCatalogEntry = CustomEmoji & { source: "generic" | "custom" };
+
+function sanitizeEmojiName(value: string): string {
+  return value
+    .trim()
+    .replace(/^:+|:+$/g, "")
+    .replace(/\s+/g, "_")
+    .replace(/[^A-Za-z0-9_+-]/g, "")
+    .slice(0, 64);
+}
+
+function emojiToken(name: string): string {
+  return `:${name}:`;
+}
+
+function isEmojiImage(value: string): boolean {
+  return /^(data:image\/|\/api\/custom-emojis\/|https?:\/\/)/i.test(value);
+}
+
+function EmojiVisual({ value, token, className = "emojiInline" }: { value: string; token: string; className?: string }) {
+  return isEmojiImage(value)
+    ? <img className={className} src={value} alt={token} title={token} />
+    : <span className={className} title={token}>{value}</span>;
+}
+
+function buildEmojiCatalog(customEmojis: CustomEmoji[] = []): EmojiCatalogEntry[] {
+  const entries: EmojiCatalogEntry[] = genericEmojiCatalog.map((emoji) => ({
+    name: emoji.name,
+    emoji: emoji.emoji,
+    source: "generic" as const
+  }));
+  for (const emoji of customEmojis) {
+    const name = sanitizeEmojiName(emoji.name);
+    const value = emoji.emoji.trim();
+    if (!name || !value) continue;
+    const key = name.toLowerCase();
+    const existingIndex = entries.findIndex((entry) => entry.name.toLowerCase() === key);
+    if (existingIndex >= 0) {
+      entries[existingIndex] = { name, emoji: value, source: "custom" };
+      continue;
+    }
+    entries.push({ name, emoji: value, source: "custom" });
+  }
+  return entries;
+}
+
+function buildEmojiMap(customEmojis: CustomEmoji[] = []): Map<string, string> {
+  const map = new Map<string, string>();
+  for (const entry of buildEmojiCatalog(customEmojis)) {
+    map.set(entry.name.toLowerCase(), entry.emoji);
+  }
+  return map;
+}
+
+function renderPlainTextWithEmojis(text: string, emojiMap: Map<string, string>): React.ReactNode[] {
+  if (!emojiMap.size) return [text];
+  const parts: React.ReactNode[] = [];
+  let lastIndex = 0;
+  for (const match of text.matchAll(emojiAliasPattern)) {
+    if (match.index === undefined) continue;
+    if (match.index > lastIndex) parts.push(text.slice(lastIndex, match.index));
+    const name = match[1];
+    const emoji = emojiMap.get(name.toLowerCase());
+    const token = match[0];
+    parts.push(
+      emoji ? (
+        <EmojiVisual value={emoji} token={token} key={`emoji-${match.index}-${token}`} />
+      ) : token
+    );
+    lastIndex = match.index + token.length;
+  }
+  if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+  return parts;
+}
 
 function createAmbientGlow(id: number): AmbientGlow {
   const colors = [
@@ -148,6 +242,15 @@ function download(filename: string, text: string) {
 
 function copyText(text: string) {
   return navigator.clipboard.writeText(text);
+}
+
+function readFileAsDataUrl(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () => reject(reader.error ?? new Error("Could not read emoji image."));
+    reader.readAsDataURL(file);
+  });
 }
 
 function hasEveryoneFooter(value: string) {
@@ -445,6 +548,8 @@ function App() {
   const draftToDelete = draftsQuery.data?.drafts.find((draft) => draft.id === confirmDeleteDraftId);
   const deferredRawMarkdown = useDeferredValue(rawMarkdown);
   const deferredStructured = useDeferredValue(structured);
+  const customEmojis = settingsQuery.data?.settings.customEmojis ?? [];
+  const emojiMap = useMemo(() => buildEmojiMap(customEmojis), [customEmojis]);
 
   const hydrateDraft = (draft: DraftRecord) => {
     hydratedDraftIdRef.current = draft.id;
@@ -731,6 +836,7 @@ function App() {
           <div className="sidePane">
             <div className="tabs">
               <button className={sideTab === "preview" ? "active" : ""} onClick={() => switchSideTab("preview")}><Eye size={14} /> Preview</button>
+              <button className={sideTab === "emojis" ? "active" : ""} onClick={() => switchSideTab("emojis")}><SmilePlus size={14} /> Emojis</button>
               <button className={sideTab === "split" ? "active" : ""} onClick={() => switchSideTab("split")}><MessagesSquare size={14} /> Messages</button>
               <button className={sideTab === "ai" ? "active" : ""} onClick={() => switchSideTab("ai")}><Bot size={14} /> AI</button>
               <button className={sideTab === "history" ? "active" : ""} onClick={() => switchSideTab("history")}><History size={14} /> History</button>
@@ -738,7 +844,14 @@ function App() {
             </div>
             <div className="sideContent">
               <div className={`sideMode ${sideTab === "preview" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "preview"}>
-                {sideTab === "preview" && <Preview rawMarkdown={deferredRawMarkdown} splitResult={splitResult} />}
+                {sideTab === "preview" && <Preview rawMarkdown={deferredRawMarkdown} splitResult={splitResult} emojiMap={emojiMap} />}
+              </div>
+              <div className={`sideMode ${sideTab === "emojis" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "emojis"}>
+                {sideTab === "emojis" && settingsQuery.data && <EmojiPanel
+                  settings={settingsQuery.data.settings}
+                  onChange={(settings) => updateSettings.mutate(settings)}
+                  onCopy={toastCopy}
+                />}
               </div>
               <div className={`sideMode ${sideTab === "split" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "split"}>
                 {sideTab === "split" && <SplitPanel
@@ -753,7 +866,7 @@ function App() {
                 />}
               </div>
               <div className={`sideMode ${sideTab === "ai" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "ai"}>
-                {activeDraft && <AiPanel draftId={activeDraft.id} rawMarkdown={rawMarkdown} structured={structured} onApply={updateStructured} />}
+                {activeDraft && <AiPanel draftId={activeDraft.id} rawMarkdown={rawMarkdown} structured={structured} customEmojis={customEmojis} onApply={updateStructured} />}
               </div>
               <div className={`sideMode ${sideTab === "history" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "history"}>
                 {sideTab === "history" && activeDraft && <HistoryPanel draftId={activeDraft.id} />}
@@ -897,9 +1010,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
   const localLogRef = useRef(log);
   const lastPropagatedLogRef = useRef<UpdateLog | null>(null);
   const commitTimeoutRef = useRef<number | null>(null);
-  const bulletDragRef = useRef<BulletDragLocation | null>(null);
-  const [bulletDrag, setBulletDrag] = useState<BulletDragLocation | null>(null);
-  const [bulletDropTarget, setBulletDropTarget] = useState<BulletDropTarget | null>(null);
+  const bulletDragSessionRef = useRef<BulletDragSession | null>(null);
   localLogRef.current = localLog;
 
   useEffect(() => {
@@ -1022,58 +1133,206 @@ const StructuredEditor = React.memo(function StructuredEditor({
     draft.sections[targetSectionIndex].items.push(item);
   }, true);
 
-  const clearBulletDrag = () => {
-    bulletDragRef.current = null;
-    setBulletDrag(null);
-    setBulletDropTarget(null);
+  const clearBulletDropTarget = (session: BulletDragSession) => {
+    session.targetElement?.classList.remove("dragTarget-before", "dragTarget-after");
+    session.targetElement = null;
+    session.target = null;
   };
 
-  const beginBulletDrag = (event: React.DragEvent<HTMLElement>, location: BulletDragLocation) => {
-    bulletDragRef.current = location;
-    setBulletDrag(location);
-    setBulletDropTarget(null);
-    event.dataTransfer.effectAllowed = "move";
-    event.dataTransfer.setData("text/plain", `${location.sectionIndex}:${location.itemIndex}`);
+  const readBulletLocation = (element: Element | null): BulletDragLocation | null => {
+    if (!(element instanceof HTMLElement)) return null;
+    const sectionIndex = Number(element.dataset.sectionIndex);
+    const itemIndex = Number(element.dataset.itemIndex);
+    if (!Number.isInteger(sectionIndex) || !Number.isInteger(itemIndex)) return null;
+    return { sectionIndex, itemIndex };
   };
 
-  const getDropSide = (event: React.DragEvent<HTMLElement>): "before" | "after" => {
-    const rect = event.currentTarget.getBoundingClientRect();
-    return event.clientY < rect.top + rect.height / 2 ? "before" : "after";
+  const getBulletDropTarget = (clientX: number, clientY: number): { target: BulletDropTarget; element: HTMLElement | null } | null => {
+    const hit = document.elementFromPoint(clientX, clientY);
+    const itemElement = hit?.closest<HTMLElement>(".itemEditor[data-section-index][data-item-index]");
+    if (itemElement) {
+      const location = readBulletLocation(itemElement);
+      if (!location) return null;
+      const rect = itemElement.getBoundingClientRect();
+      return {
+        target: {
+          ...location,
+          side: clientY < rect.top + rect.height / 2 ? "before" : "after"
+        },
+        element: itemElement
+      };
+    }
+
+    const sectionElement = hit?.closest<HTMLElement>(".sectionEditor[data-section-index]");
+    if (!sectionElement) return null;
+    const sectionIndex = Number(sectionElement.dataset.sectionIndex);
+    if (!Number.isInteger(sectionIndex)) return null;
+    const itemElements = [...sectionElement.querySelectorAll<HTMLElement>(".itemEditor[data-section-index][data-item-index]")];
+    if (!itemElements.length) {
+      return {
+        target: { sectionIndex, itemIndex: 0, side: "after" },
+        element: sectionElement.querySelector<HTMLElement>(".sectionBodyInner")
+      };
+    }
+
+    let closestElement = itemElements[0];
+    let closestDistance = Number.POSITIVE_INFINITY;
+    for (const candidate of itemElements) {
+      const rect = candidate.getBoundingClientRect();
+      const centerY = rect.top + rect.height / 2;
+      const distance = Math.abs(clientY - centerY);
+      if (distance < closestDistance) {
+        closestDistance = distance;
+        closestElement = candidate;
+      }
+    }
+    const location = readBulletLocation(closestElement);
+    if (!location) return null;
+    const rect = closestElement.getBoundingClientRect();
+    return {
+      target: {
+        ...location,
+        side: clientY < rect.top + rect.height / 2 ? "before" : "after"
+      },
+      element: closestElement
+    };
   };
 
-  const updateBulletDrop = (event: React.DragEvent<HTMLElement>, sectionIndex: number, itemIndex: number) => {
-    if (!bulletDragRef.current) return;
-    event.preventDefault();
-    event.dataTransfer.dropEffect = "move";
-    const side = getDropSide(event);
-    setBulletDropTarget((current) => {
-      if (current?.sectionIndex === sectionIndex && current.itemIndex === itemIndex && current.side === side) return current;
-      return { sectionIndex, itemIndex, side };
-    });
+  const setBulletDropTargetDom = (session: BulletDragSession, next: { target: BulletDropTarget; element: HTMLElement | null } | null) => {
+    const current = session.target;
+    const sameTarget = current && next &&
+      current.sectionIndex === next.target.sectionIndex &&
+      current.itemIndex === next.target.itemIndex &&
+      current.side === next.target.side &&
+      session.targetElement === next.element;
+    if (sameTarget) return;
+    clearBulletDropTarget(session);
+    if (!next) return;
+    session.target = next.target;
+    session.targetElement = next.element;
+    next.element?.classList.add(`dragTarget-${next.target.side}`);
   };
 
-  const dropBullet = (event: React.DragEvent<HTMLElement>, sectionIndex: number, itemIndex: number) => {
-    const source = bulletDragRef.current;
-    if (!source) return;
-    event.preventDefault();
-    const side = getDropSide(event);
+  const reorderBullet = (source: BulletDragLocation, target: BulletDropTarget) => {
     setLog((draft) => {
       const sourceSection = draft.sections[source.sectionIndex];
-      const targetSection = draft.sections[sectionIndex];
+      const targetSection = draft.sections[target.sectionIndex];
       if (!sourceSection || !targetSection) return;
       const sourceItems = sourceSection.items;
       if (source.itemIndex < 0 || source.itemIndex >= sourceItems.length) return;
-      let insertIndex = side === "after" ? itemIndex + 1 : itemIndex;
+      let insertIndex = target.side === "after" ? target.itemIndex + 1 : target.itemIndex;
       const [item] = sourceItems.splice(source.itemIndex, 1);
       const targetItems = targetSection.items;
-      if (source.sectionIndex === sectionIndex && source.itemIndex < insertIndex) {
+      if (source.sectionIndex === target.sectionIndex && source.itemIndex < insertIndex) {
         insertIndex -= 1;
       }
       insertIndex = Math.max(0, Math.min(insertIndex, targetItems.length));
       targetItems.splice(insertIndex, 0, item);
     }, true);
-    clearBulletDrag();
   };
+
+  const finishBulletDrag = (commit: boolean) => {
+    const session = bulletDragSessionRef.current;
+    if (!session) return;
+    bulletDragSessionRef.current = null;
+    window.removeEventListener("pointermove", session.onPointerMove);
+    window.removeEventListener("pointerup", session.onPointerUp);
+    window.removeEventListener("pointercancel", session.onPointerCancel);
+    if (session.rafId !== null) window.cancelAnimationFrame(session.rafId);
+    if (session.autoScrollRafId !== null) window.cancelAnimationFrame(session.autoScrollRafId);
+    clearBulletDropTarget(session);
+    session.element.classList.remove("dragging");
+    session.element.style.removeProperty("--drag-y");
+    structuredRef.current?.classList.remove("dragActive");
+    if (commit && session.target) {
+      reorderBullet(session.source, session.target);
+    }
+  };
+
+  const scheduleBulletDragFrame = (session: BulletDragSession) => {
+    if (session.rafId !== null) return;
+    session.rafId = window.requestAnimationFrame(() => {
+      session.rafId = null;
+      const scrollDelta = (structuredRef.current?.scrollTop ?? session.scrollStartTop) - session.scrollStartTop;
+      session.element.style.setProperty("--drag-y", `${session.pointerY - session.pointerStartY + scrollDelta}px`);
+      setBulletDropTargetDom(session, getBulletDropTarget(session.pointerX, session.pointerY));
+    });
+  };
+
+  const runBulletAutoScroll = (session: BulletDragSession) => {
+    const container = structuredRef.current;
+    if (!container || bulletDragSessionRef.current !== session) return;
+    const rect = container.getBoundingClientRect();
+    const edgeSize = 96;
+    const topDistance = session.pointerY - rect.top;
+    const bottomDistance = rect.bottom - session.pointerY;
+    let scrollDelta = 0;
+    if (topDistance < edgeSize) {
+      scrollDelta = -Math.round(((edgeSize - topDistance) / edgeSize) * 18);
+    } else if (bottomDistance < edgeSize) {
+      scrollDelta = Math.round(((edgeSize - bottomDistance) / edgeSize) * 18);
+    }
+    if (scrollDelta !== 0) {
+      container.scrollTop += scrollDelta;
+      scheduleBulletDragFrame(session);
+    }
+    session.autoScrollRafId = window.requestAnimationFrame(() => runBulletAutoScroll(session));
+  };
+
+  const beginBulletDrag = (event: React.PointerEvent<HTMLButtonElement>, location: BulletDragLocation) => {
+    if (event.button !== 0) return;
+    const itemElement = event.currentTarget.closest<HTMLElement>(".itemEditor");
+    if (!itemElement) return;
+    event.preventDefault();
+    event.stopPropagation();
+    finishBulletDrag(false);
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const activeSession = bulletDragSessionRef.current;
+      if (!activeSession || moveEvent.pointerId !== activeSession.pointerId) return;
+      activeSession.pointerX = moveEvent.clientX;
+      activeSession.pointerY = moveEvent.clientY;
+      scheduleBulletDragFrame(activeSession);
+    };
+    const onPointerUp = (upEvent: PointerEvent) => {
+      const activeSession = bulletDragSessionRef.current;
+      if (!activeSession || upEvent.pointerId !== activeSession.pointerId) return;
+      finishBulletDrag(true);
+    };
+    const onPointerCancel = (cancelEvent: PointerEvent) => {
+      const activeSession = bulletDragSessionRef.current;
+      if (!activeSession || cancelEvent.pointerId !== activeSession.pointerId) return;
+      finishBulletDrag(false);
+    };
+    const session: BulletDragSession = {
+      source: location,
+      element: itemElement,
+      pointerId: event.pointerId,
+      pointerStartY: event.clientY,
+      scrollStartTop: structuredRef.current?.scrollTop ?? 0,
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      target: null,
+      targetElement: null,
+      rafId: null,
+      autoScrollRafId: null,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel
+    };
+    bulletDragSessionRef.current = session;
+    itemElement.style.setProperty("--drag-y", "0px");
+    itemElement.classList.add("dragging");
+    structuredRef.current?.classList.add("dragActive");
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerCancel);
+    setBulletDropTargetDom(session, getBulletDropTarget(event.clientX, event.clientY));
+    session.autoScrollRafId = window.requestAnimationFrame(() => runBulletAutoScroll(session));
+  };
+
+  useEffect(() => () => {
+    finishBulletDrag(false);
+  }, []);
 
   const addBulletToSection = (sectionIndex = clampedActiveSectionIndex) => setLog((draft) => {
     if (!draft.sections[sectionIndex]) {
@@ -1154,18 +1413,16 @@ const StructuredEditor = React.memo(function StructuredEditor({
             <div className="sectionBodyInner">
               {section.items.map((item, itemIndex) => (
                 <div
-                  className={`itemEditor${bulletDrag?.sectionIndex === sectionIndex && bulletDrag.itemIndex === itemIndex ? " dragging" : ""}${bulletDropTarget?.sectionIndex === sectionIndex && bulletDropTarget.itemIndex === itemIndex ? ` dragTarget-${bulletDropTarget.side}` : ""}`}
+                  className="itemEditor"
                   key={`item-${sectionIndex}-${itemIndex}`}
-                  onDragOver={(event) => updateBulletDrop(event, sectionIndex, itemIndex)}
-                  onDrop={(event) => dropBullet(event, sectionIndex, itemIndex)}
+                  data-section-index={sectionIndex}
+                  data-item-index={itemIndex}
                 >
                   <div className="itemLine">
                     <button
                       className="iconButton dragHandle"
                       title="Drag bullet to reorder"
-                      draggable
-                      onDragStart={(event) => beginBulletDrag(event, { sectionIndex, itemIndex })}
-                      onDragEnd={clearBulletDrag}
+                      onPointerDown={(event) => beginBulletDrag(event, { sectionIndex, itemIndex })}
                     >
                       <GripVertical size={16} />
                     </button>
@@ -1253,10 +1510,12 @@ const StructuredEditor = React.memo(function StructuredEditor({
 
 const Preview = React.memo(function Preview({
   rawMarkdown,
-  splitResult
+  splitResult,
+  emojiMap
 }: {
   rawMarkdown: string;
   splitResult: ReturnType<typeof splitDiscordMessages>;
+  emojiMap: Map<string, string>;
 }) {
   const [mode, setMode] = useState<"desktop" | "mobile" | "raw">("desktop");
   const previewTime = useMemo(() => new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }), []);
@@ -1288,7 +1547,7 @@ const Preview = React.memo(function Preview({
                   <strong>Bird</strong>
                   <span>Today at {previewTime}{parts.length > 1 ? `, part ${index + 1}/${parts.length}` : ""}</span>
                 </div>
-                <div className="discordPreview"><DiscordMarkdown raw={part} /></div>
+                <div className="discordPreview"><DiscordMarkdown raw={part} emojiMap={emojiMap} /></div>
               </div>
             </div>
           ))}
@@ -1299,7 +1558,7 @@ const Preview = React.memo(function Preview({
   );
 });
 
-const DiscordMarkdown = React.memo(function DiscordMarkdown({ raw }: { raw: string }) {
+const DiscordMarkdown = React.memo(function DiscordMarkdown({ raw, emojiMap }: { raw: string; emojiMap: Map<string, string> }) {
   const nodes = useMemo(() => {
     const lines = raw.replace(/\r\n/g, "\n").split("\n");
     const nextNodes: React.ReactNode[] = [];
@@ -1332,65 +1591,230 @@ const DiscordMarkdown = React.memo(function DiscordMarkdown({ raw }: { raw: stri
         return;
       }
       if (line.startsWith("## ") && !line.startsWith("### ")) {
-        nextNodes.push(<h2 key={index}>{renderInline(line.slice(3))}</h2>);
+        nextNodes.push(<h2 key={index}>{renderInline(line.slice(3), emojiMap)}</h2>);
         return;
       }
       if (line.startsWith("### ")) {
-        nextNodes.push(<h3 key={index}>{renderInline(line.slice(4))}</h3>);
+        nextNodes.push(<h3 key={index}>{renderInline(line.slice(4), emojiMap)}</h3>);
         return;
       }
       if (line.startsWith("-# ")) {
-        nextNodes.push(<p className="subtext" key={index}>{renderInline(line.slice(3))}</p>);
+        nextNodes.push(<p className="subtext" key={index}>{renderInline(line.slice(3), emojiMap)}</p>);
         return;
       }
       if (line.startsWith("  -# ")) {
-        nextNodes.push(<p className="subtext nestedSubtext" key={index}>{renderInline(line.slice(5))}</p>);
+        nextNodes.push(<p className="subtext nestedSubtext" key={index}>{renderInline(line.slice(5), emojiMap)}</p>);
         return;
       }
       if (line.startsWith("> ")) {
-        nextNodes.push(<blockquote key={index}>{renderInline(line.slice(2))}</blockquote>);
+        nextNodes.push(<blockquote key={index}>{renderInline(line.slice(2), emojiMap)}</blockquote>);
         return;
       }
       if (line.startsWith("  - ")) {
-        nextNodes.push(<div className="previewBullet nested" key={index}><span>{"\u25e6"}</span><p>{renderInline(line.slice(4))}</p></div>);
+        nextNodes.push(<div className="previewBullet nested" key={index}><span>{"\u25e6"}</span><p>{renderInline(line.slice(4), emojiMap)}</p></div>);
         return;
       }
       if (line.startsWith("- ")) {
-        nextNodes.push(<div className="previewBullet" key={index}><span>{"\u2022"}</span><p>{renderInline(line.slice(2))}</p></div>);
+        nextNodes.push(<div className="previewBullet" key={index}><span>{"\u2022"}</span><p>{renderInline(line.slice(2), emojiMap)}</p></div>);
         return;
       }
-      nextNodes.push(<p key={index}>{renderInline(line)}</p>);
+      nextNodes.push(<p key={index}>{renderInline(line, emojiMap)}</p>);
     });
     flushCode(lines.length + 1);
     return nextNodes;
-  }, [raw]);
+  }, [raw, emojiMap]);
 
   return <>{nodes}</>;
 });
 
-function renderInline(text: string): React.ReactNode[] {
+function renderInline(text: string, emojiMap: Map<string, string>): React.ReactNode[] {
   const pattern = /(`[^`]+`|\|\|[^|]+\|\||\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
   const parts: React.ReactNode[] = [];
   let lastIndex = 0;
   for (const match of text.matchAll(pattern)) {
     if (match.index === undefined) continue;
-    if (match.index > lastIndex) parts.push(text.slice(lastIndex, match.index));
+    if (match.index > lastIndex) parts.push(...renderPlainTextWithEmojis(text.slice(lastIndex, match.index), emojiMap));
     const token = match[0];
     const key = `${match.index}-${token}`;
     if (token.startsWith("`")) parts.push(<code key={key}>{token.slice(1, -1)}</code>);
-    else if (token.startsWith("||")) parts.push(<span className="spoiler" key={key}>{renderInline(token.slice(2, -2))}</span>);
-    else if (token.startsWith("**")) parts.push(<strong key={key}>{renderInline(token.slice(2, -2))}</strong>);
-    else if (token.startsWith("__")) parts.push(<u key={key}>{renderInline(token.slice(2, -2))}</u>);
-    else if (token.startsWith("~~")) parts.push(<s key={key}>{renderInline(token.slice(2, -2))}</s>);
-    else if (token.startsWith("*")) parts.push(<em key={key}>{renderInline(token.slice(1, -1))}</em>);
+    else if (token.startsWith("||")) parts.push(<span className="spoiler" key={key}>{renderInline(token.slice(2, -2), emojiMap)}</span>);
+    else if (token.startsWith("**")) parts.push(<strong key={key}>{renderInline(token.slice(2, -2), emojiMap)}</strong>);
+    else if (token.startsWith("__")) parts.push(<u key={key}>{renderInline(token.slice(2, -2), emojiMap)}</u>);
+    else if (token.startsWith("~~")) parts.push(<s key={key}>{renderInline(token.slice(2, -2), emojiMap)}</s>);
+    else if (token.startsWith("*")) parts.push(<em key={key}>{renderInline(token.slice(1, -1), emojiMap)}</em>);
     else {
       const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-      parts.push(link ? <a key={key} href={link[2]} target="_blank" rel="noreferrer">{renderInline(link[1])}</a> : token);
+      parts.push(link ? <a key={key} href={link[2]} target="_blank" rel="noreferrer">{renderInline(link[1], emojiMap)}</a> : token);
     }
     lastIndex = match.index + token.length;
   }
-  if (lastIndex < text.length) parts.push(text.slice(lastIndex));
+  if (lastIndex < text.length) parts.push(...renderPlainTextWithEmojis(text.slice(lastIndex), emojiMap));
   return parts;
+}
+
+function EmojiPanel({
+  settings,
+  onChange,
+  onCopy
+}: {
+  settings: AppSettings;
+  onChange: (settings: AppSettings) => void;
+  onCopy: (text: string, label: string) => void;
+}) {
+  const [name, setName] = useState("");
+  const [file, setFile] = useState<File | null>(null);
+  const [error, setError] = useState("");
+  const [isUploading, setIsUploading] = useState(false);
+  const [isDraggingFile, setIsDraggingFile] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState("");
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const catalog = useMemo(() => buildEmojiCatalog(settings.customEmojis), [settings.customEmojis]);
+  const genericEntries = catalog.filter((entry) => entry.source === "generic");
+  const customEntries = catalog.filter((entry) => entry.source === "custom");
+  const cleanedName = sanitizeEmojiName(name);
+  const previewToken = cleanedName ? emojiToken(cleanedName) : ":Name:";
+
+  useEffect(() => {
+    if (!file) {
+      setPreviewUrl("");
+      return;
+    }
+    const objectUrl = URL.createObjectURL(file);
+    setPreviewUrl(objectUrl);
+    return () => URL.revokeObjectURL(objectUrl);
+  }, [file]);
+
+  const selectFile = (nextFile: File | undefined | null) => {
+    setFile(nextFile ?? null);
+    setError("");
+  };
+
+  const addCustomEmoji = async () => {
+    const nextName = cleanedName;
+    if (!nextName || !file) {
+      setError("Add a name and upload an image.");
+      return;
+    }
+    if (!["image/png", "image/jpeg", "image/gif", "image/webp"].includes(file.type)) {
+      setError("Use a PNG, JPG, GIF, or WEBP image.");
+      return;
+    }
+    if (file.size > 2_000_000) {
+      setError("Emoji image must be 2 MB or smaller.");
+      return;
+    }
+    try {
+      setIsUploading(true);
+      const dataUrl = await readFileAsDataUrl(file);
+      const uploaded = await api<UploadEmojiResponse>("/api/emojis/upload", {
+        method: "POST",
+        body: JSON.stringify({ name: nextName, mimeType: file.type, dataUrl })
+      });
+      const withoutDuplicate = settings.customEmojis.filter((entry) => entry.name.toLowerCase() !== nextName.toLowerCase());
+      onChange({ ...settings, customEmojis: [...withoutDuplicate, uploaded.emoji] });
+      setName("");
+      selectFile(null);
+      setError("");
+    } catch (uploadError) {
+      setError(uploadError instanceof Error ? uploadError.message : "Emoji upload failed.");
+    } finally {
+      setIsUploading(false);
+    }
+  };
+
+  const removeCustomEmoji = (targetName: string) => {
+    onChange({
+      ...settings,
+      customEmojis: settings.customEmojis.filter((entry) => entry.name.toLowerCase() !== targetName.toLowerCase())
+    });
+  };
+
+  const EmojiTile = ({ entry, removable = false }: { entry: EmojiCatalogEntry; removable?: boolean }) => {
+    const token = emojiToken(entry.name);
+    return (
+      <div className="emojiTile">
+        <button className="emojiTokenButton" onClick={() => onCopy(token, `${token} copied`)}>
+          <EmojiVisual value={entry.emoji} token={token} className="emojiPreview" />
+          <span>
+            <strong>{entry.name}</strong>
+            <code>{token}</code>
+          </span>
+        </button>
+        {removable && (
+          <button className="iconButton dangerButton" title={`Remove ${entry.name}`} onClick={() => removeCustomEmoji(entry.name)}>
+            <Trash2 size={14} />
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  return (
+    <div className="emojiPanel">
+      <div className="panelTitle">
+        <div>
+          <h3>Custom Emojis</h3>
+          <span>Uploaded images rendered from Discord-style tokens</span>
+        </div>
+      </div>
+      <div className="emojiComposer">
+        <div className="emojiUploadFields">
+          <label>Name
+            <input value={name} onChange={(event) => setName(sanitizeEmojiName(event.target.value))} placeholder="Star" />
+          </label>
+          <div className="emojiTokenPreview">
+            <span>Token</span>
+            <code>{previewToken}</code>
+          </div>
+        </div>
+        <button
+          type="button"
+          className={`emojiDropZone${previewUrl ? " hasPreview" : ""}${isDraggingFile ? " dragging" : ""}`}
+          onClick={() => fileInputRef.current?.click()}
+          onDragOver={(event) => {
+            event.preventDefault();
+            setIsDraggingFile(true);
+          }}
+          onDragLeave={() => setIsDraggingFile(false)}
+          onDrop={(event) => {
+            event.preventDefault();
+            setIsDraggingFile(false);
+            selectFile(event.dataTransfer.files[0]);
+          }}
+        >
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/gif,image/webp"
+            onChange={(event) => selectFile(event.target.files?.[0])}
+          />
+          {previewUrl ? (
+            <img src={previewUrl} alt="Custom emoji preview" />
+          ) : (
+            <span className="emojiDropIcon"><SmilePlus size={22} /></span>
+          )}
+          <span>
+            <strong>{file ? file.name : "Upload emoji image"}</strong>
+            <small>{file ? `${Math.ceil(file.size / 1024)} KB selected` : "PNG, JPG, GIF, or WEBP"}</small>
+          </span>
+        </button>
+        <button className="primary emojiUploadButton" disabled={isUploading} onClick={addCustomEmoji}>
+          <Plus size={15} /> {isUploading ? "Uploading..." : "Upload"}
+        </button>
+      </div>
+      {error && <div className="warning">{error}</div>}
+      <h3>Custom</h3>
+      <div className="emojiGrid">
+        {customEntries.length
+          ? customEntries.map((entry) => <EmojiTile key={`custom-${entry.name}`} entry={entry} removable />)
+          : <div className="emptyState">No custom emojis yet.</div>}
+      </div>
+      <h3>Generic</h3>
+      <div className="emojiGrid">
+        {genericEntries.map((entry) => <EmojiTile key={`generic-${entry.name}`} entry={entry} />)}
+      </div>
+    </div>
+  );
 }
 
 const SplitPanel = React.memo(function SplitPanel({
@@ -1473,7 +1897,19 @@ const SplitPanel = React.memo(function SplitPanel({
   );
 });
 
-function AiPanel({ draftId, rawMarkdown, structured, onApply }: { draftId: string; rawMarkdown: string; structured: UpdateLog; onApply: (log: UpdateLog) => void }) {
+function AiPanel({
+  draftId,
+  rawMarkdown,
+  structured,
+  customEmojis,
+  onApply
+}: {
+  draftId: string;
+  rawMarkdown: string;
+  structured: UpdateLog;
+  customEmojis: CustomEmoji[];
+  onApply: (log: UpdateLog) => void;
+}) {
   const [instruction, setInstruction] = useState("");
   const [modelMode, setModelMode] = useState("default");
   const [customModel, setCustomModel] = useState("");
@@ -1495,6 +1931,7 @@ function AiPanel({ draftId, rawMarkdown, structured, onApply }: { draftId: strin
         rawMarkdown,
         draft: structured,
         instruction,
+        customEmojis,
         model: modelMode === "custom" ? customModel : modelMode
       })
     }),
