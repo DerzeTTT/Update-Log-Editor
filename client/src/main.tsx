@@ -1,22 +1,25 @@
 import React, { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { createRoot } from "react-dom/client";
+import { createPortal } from "react-dom";
 import Editor from "@monaco-editor/react";
 import { QueryClient, QueryClientProvider, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { diffLines } from "diff";
 import {
+  Bold,
   Bot,
   Check,
-  ArrowDown,
-  ArrowUp,
   ChevronDown,
   Clipboard,
+  Code2,
   Copy,
   Download,
+  EyeOff,
   FilePlus,
   FileText,
   GripVertical,
   History,
   Eye,
+  Italic,
   ListPlus,
   MessagesSquare,
   Moon,
@@ -25,67 +28,225 @@ import {
   Save,
   Settings,
   SmilePlus,
+  Strikethrough,
   Trash2,
+  Underline,
   X
 } from "lucide-react";
-import { cloneLog, parseUpdateLog, serializeUpdateLog } from "../../shared/markdown";
+import { parseUpdateLog, serializeUpdateLog } from "../../shared/markdown";
 import { splitDiscordMessages } from "../../shared/splitter";
-import { genericEmojiCatalog, type AiEditResponse, type AppSettings, type CustomEmoji, type DraftRecord, type LogItem, type UpdateLog, type VersionRecord } from "../../shared/types";
+import { genericEmojiCatalog, type AiEditResponse, type AppSettings, type CustomEmoji, type DraftBackupSummary, type DraftRecord, type DraftSummary, type LogItem, type SplitOptions, type SplitResult, type UpdateLog, type VersionRecord, type VersionSummary } from "../../shared/types";
+import type { MarkdownWorkerRequest, MarkdownWorkerResponse } from "./markdownWorker";
 import "./styles.css";
 
-type DraftsResponse = { drafts: DraftRecord[] };
+type DraftsResponse = { drafts: DraftSummary[] };
 type DraftResponse = { draft: DraftRecord };
 type SettingsResponse = { settings: AppSettings };
 type UploadEmojiResponse = { emoji: CustomEmoji };
-type VersionsResponse = { versions: VersionRecord[] };
-type SaveVersionResponse = { version: VersionRecord; draft: DraftRecord };
+type VersionsResponse = { versions: VersionSummary[] };
+type VersionResponse = { version: VersionRecord };
+type SaveVersionResponse = { version: VersionSummary | null; draft: DraftRecord };
+type DraftBackupsResponse = { backupDir: string; latestBackupPath: string; backups: DraftBackupSummary[] };
 type SelectOption = { value: string; label: string; meta?: string };
 type EditorTab = "raw" | "structured";
 type SideTab = "preview" | "emojis" | "split" | "ai" | "history" | "settings";
 type SlideDirection = "slideForward" | "slideBack";
-type BulletDragLocation = { sectionIndex: number; itemIndex: number };
-type BulletDropTarget = BulletDragLocation & { side: "before" | "after" };
+type EditableLogItem = LogItem & {
+  uiId: string;
+  childUiIds: string[];
+  footerUiIds: string[];
+};
+type EditableLogSection = {
+  uiId: string;
+  title: string;
+  items: EditableLogItem[];
+};
+type EditableUpdateLog = {
+  title: string;
+  sections: EditableLogSection[];
+  footer: string;
+};
+type DraftRecoveryEntry = {
+  draftId: string;
+  name: string;
+  rawMarkdown: string;
+  updatedAt: string;
+  serverUpdatedAt?: string;
+};
+type DraftRecoveryStore = {
+  version: 1;
+  drafts: Record<string, DraftRecoveryEntry>;
+};
+type BulletDragLocation = { sectionIndex: number; sectionUiId: string; itemIndex: number; itemUiId: string };
+type BulletDropTarget = { sectionIndex: number; sectionUiId: string; itemIndex: number; itemUiId?: string; side: "before" | "after" };
+type SectionDragLocation = { sectionIndex: number; sectionUiId: string };
+type SectionDropTarget = SectionDragLocation & { side: "before" | "after" };
 type BulletDragSession = {
   source: BulletDragLocation;
   element: HTMLElement;
+  handleElement: HTMLElement;
   pointerId: number;
-  pointerStartY: number;
-  scrollStartTop: number;
+  dragOffsetY: number;
+  dragTranslateY: number;
   pointerX: number;
   pointerY: number;
   target: BulletDropTarget | null;
   targetElement: HTMLElement | null;
+  shiftedElements: Set<HTMLElement>;
   rafId: number | null;
   autoScrollRafId: number | null;
   onPointerMove: (event: PointerEvent) => void;
   onPointerUp: (event: PointerEvent) => void;
   onPointerCancel: (event: PointerEvent) => void;
 };
-type AmbientGlow = {
-  id: number;
-  color: string;
-  size: string;
-  x: string;
-  y: string;
-  dx: string;
-  dy: string;
-  duration: string;
+type SectionDragSession = {
+  source: SectionDragLocation;
+  element: HTMLElement;
+  handleElement: HTMLElement;
+  pointerId: number;
+  dragOffsetY: number;
+  dragTranslateY: number;
+  pointerX: number;
+  pointerY: number;
+  target: SectionDropTarget | null;
+  targetElement: HTMLElement | null;
+  shiftedElements: Set<HTMLElement>;
+  rafId: number | null;
+  autoScrollRafId: number | null;
+  onPointerMove: (event: PointerEvent) => void;
+  onPointerUp: (event: PointerEvent) => void;
+  onPointerCancel: (event: PointerEvent) => void;
 };
 const sectionMenuOptionsLimit = 12;
 const everyoneFooter = "-# ||@everyone||";
 const editorTabOrder: EditorTab[] = ["raw", "structured"];
 const sideTabOrder: SideTab[] = ["preview", "emojis", "split", "ai", "history", "settings"];
 const markdownInputCommitDelayMs = 650;
-const rawParseDebounceMs = 360;
+const markdownWorkerDebounceMs = 120;
+const recoveryStorageKey = "update-log-editor.recovery.v1";
+const recoveryFreshnessToleranceMs = 500;
+const maxRecoveryDrafts = 30;
+const emptySplitResult: SplitResult = { chunks: [], limit: 2000, totalCharacters: 0, warnings: [] };
 const codexStatusQueryOptions = {
-  staleTime: 30_000,
+  staleTime: 60_000,
   refetchOnWindowFocus: false
 };
 const emojiAliasPattern = /:([A-Za-z0-9_+-]{1,64}):/g;
+const inlineMarkdownFormats = [
+  { id: "bold", label: "Bold", marker: "**", icon: Bold },
+  { id: "italic", label: "Italic", marker: "*", icon: Italic },
+  { id: "underline", label: "Underline", marker: "__", icon: Underline },
+  { id: "strike", label: "Strikethrough", marker: "~~", icon: Strikethrough },
+  { id: "code", label: "Inline code", marker: "`", icon: Code2 },
+  { id: "spoiler", label: "Spoiler", marker: "||", icon: EyeOff }
+] as const;
 
 const queryClient = new QueryClient();
 
 type EmojiCatalogEntry = CustomEmoji & { source: "generic" | "custom" };
+type InlineToolbarState = {
+  top: number;
+  left: number;
+  start: number;
+  end: number;
+};
+type InlineFormatMarker = typeof inlineMarkdownFormats[number]["marker"];
+
+let uiIdCounter = 0;
+
+function createUiId(prefix: string) {
+  uiIdCounter += 1;
+  return `${prefix}-${Date.now().toString(36)}-${uiIdCounter.toString(36)}`;
+}
+
+function withUiIds(log: UpdateLog | EditableUpdateLog): EditableUpdateLog {
+  return {
+    title: log.title,
+    footer: log.footer,
+    sections: log.sections.map((section) => {
+      const editableSection = section as Partial<EditableLogSection>;
+      return {
+        uiId: editableSection.uiId ?? createUiId("section"),
+        title: section.title,
+        items: section.items.map((item) => {
+          const editableItem = item as Partial<EditableLogItem>;
+          return {
+            text: item.text,
+            children: [...item.children],
+            footers: [...(item.footers ?? [])],
+            uiId: editableItem.uiId ?? createUiId("item"),
+            childUiIds: item.children.map((_child, index) => editableItem.childUiIds?.[index] ?? createUiId("child")),
+            footerUiIds: (item.footers ?? []).map((_footer, index) => editableItem.footerUiIds?.[index] ?? createUiId("footer"))
+          };
+        })
+      };
+    })
+  };
+}
+
+function stripUiIds(log: UpdateLog | EditableUpdateLog): UpdateLog {
+  return {
+    title: log.title,
+    footer: log.footer,
+    sections: log.sections.map((section) => ({
+      title: section.title,
+      items: section.items.map((item) => ({
+        text: item.text,
+        children: [...item.children],
+        footers: [...(item.footers ?? [])]
+      }))
+    }))
+  };
+}
+
+function cloneEditableLog(log: EditableUpdateLog): EditableUpdateLog {
+  return {
+    title: log.title,
+    footer: log.footer,
+    sections: log.sections.map((section) => ({
+      uiId: section.uiId,
+      title: section.title,
+      items: section.items.map((item) => ({
+        uiId: item.uiId,
+        text: item.text,
+        children: [...item.children],
+        footers: [...(item.footers ?? [])],
+        childUiIds: [...item.childUiIds],
+        footerUiIds: [...item.footerUiIds]
+      }))
+    }))
+  };
+}
+
+function draftSummaryFromRecord(draft: DraftRecord): DraftSummary {
+  return {
+    id: draft.id,
+    name: draft.name,
+    filePath: draft.filePath,
+    createdAt: draft.createdAt,
+    updatedAt: draft.updatedAt,
+    rawLength: draft.rawMarkdown.length
+  };
+}
+
+function hashString(value: string): string {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function draftPayloadKey(draftId: string, name: string, rawMarkdown: string, structured: UpdateLog): string {
+  return `${draftId}|${name}|${hashString(rawMarkdown)}|${hashString(JSON.stringify(structured))}`;
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1000) return `${bytes.toLocaleString()} B`;
+  if (bytes < 1000 * 1000) return `${(bytes / 1000).toFixed(1)} KB`;
+  return `${(bytes / 1000 / 1000).toFixed(1)} MB`;
+}
 
 function sanitizeEmojiName(value: string): string {
   return value
@@ -139,7 +300,7 @@ function buildEmojiMap(customEmojis: CustomEmoji[] = []): Map<string, string> {
   return map;
 }
 
-function renderPlainTextWithEmojis(text: string, emojiMap: Map<string, string>): React.ReactNode[] {
+function renderPlainTextWithEmojis(text: string, emojiMap: Map<string, string>, keyPrefix = "text"): React.ReactNode[] {
   if (!emojiMap.size) return [text];
   const parts: React.ReactNode[] = [];
   let lastIndex = 0;
@@ -151,7 +312,7 @@ function renderPlainTextWithEmojis(text: string, emojiMap: Map<string, string>):
     const token = match[0];
     parts.push(
       emoji ? (
-        <EmojiVisual value={emoji} token={token} key={`emoji-${match.index}-${token}`} />
+        <EmojiVisual value={emoji} token={token} key={`${keyPrefix}-emoji-${match.index}-${token}`} />
       ) : token
     );
     lastIndex = match.index + token.length;
@@ -159,63 +320,6 @@ function renderPlainTextWithEmojis(text: string, emojiMap: Map<string, string>):
   if (lastIndex < text.length) parts.push(text.slice(lastIndex));
   return parts;
 }
-
-function createAmbientGlow(id: number): AmbientGlow {
-  const colors = [
-    "rgba(76,131,255,0.42)",
-    "rgba(36,161,222,0.34)",
-    "rgba(255,104,117,0.24)",
-    "rgba(155,115,255,0.30)"
-  ];
-  return {
-    id,
-    color: colors[Math.floor(Math.random() * colors.length)],
-    size: `${440 + Math.round(Math.random() * 360)}px`,
-    x: `${Math.round(-10 + Math.random() * 105)}vw`,
-    y: `${Math.round(-12 + Math.random() * 98)}vh`,
-    dx: `${Math.round(-22 + Math.random() * 44)}vw`,
-    dy: `${Math.round(-18 + Math.random() * 36)}vh`,
-    duration: `${15000 + Math.round(Math.random() * 8000)}ms`
-  };
-}
-
-const AmbientGlows = React.memo(function AmbientGlows() {
-  const [ambientGlows, setAmbientGlows] = useState<AmbientGlow[]>([]);
-
-  useEffect(() => {
-    let nextId = 1;
-    const spawn = () => {
-      const glow = createAmbientGlow(nextId++);
-      setAmbientGlows((current) => [...current.slice(-3), glow]);
-      window.setTimeout(() => {
-        setAmbientGlows((current) => current.filter((entry) => entry.id !== glow.id));
-      }, Number.parseInt(glow.duration, 10) + 900);
-    };
-    spawn();
-    const interval = window.setInterval(spawn, 4300);
-    return () => window.clearInterval(interval);
-  }, []);
-
-  return (
-    <div className="ambientGlows" aria-hidden="true">
-      {ambientGlows.map((glow) => (
-        <span
-          key={glow.id}
-          className="ambientGlow"
-          style={{
-            "--glow-color": glow.color,
-            "--glow-size": glow.size,
-            "--glow-x": glow.x,
-            "--glow-y": glow.y,
-            "--glow-dx": glow.dx,
-            "--glow-dy": glow.dy,
-            "--glow-duration": glow.duration
-          } as React.CSSProperties}
-        />
-      ))}
-    </div>
-  );
-});
 
 async function api<T>(path: string, options?: RequestInit): Promise<T> {
   const response = await fetch(path, {
@@ -228,6 +332,84 @@ async function api<T>(path: string, options?: RequestInit): Promise<T> {
   }
   if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
+}
+
+function readRecoveryStore(): DraftRecoveryStore {
+  if (typeof window === "undefined") return { version: 1, drafts: {} };
+  try {
+    const raw = window.localStorage.getItem(recoveryStorageKey);
+    if (!raw) return { version: 1, drafts: {} };
+    const parsed = JSON.parse(raw) as Partial<DraftRecoveryStore>;
+    return { version: 1, drafts: parsed.drafts ?? {} };
+  } catch {
+    return { version: 1, drafts: {} };
+  }
+}
+
+function writeRecoveryStore(store: DraftRecoveryStore): boolean {
+  if (typeof window === "undefined") return false;
+  try {
+    window.localStorage.setItem(recoveryStorageKey, JSON.stringify(store));
+    return true;
+  } catch {
+    const entries = Object.values(store.drafts)
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+      .slice(0, Math.max(1, Math.floor(maxRecoveryDrafts / 2)));
+    try {
+      window.localStorage.setItem(recoveryStorageKey, JSON.stringify({
+        version: 1,
+        drafts: Object.fromEntries(entries.map((entry) => [entry.draftId, entry]))
+      } satisfies DraftRecoveryStore));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function getDraftRecoveryEntry(draftId: string): DraftRecoveryEntry | undefined {
+  return readRecoveryStore().drafts[draftId];
+}
+
+function saveDraftRecoveryEntry(entry: DraftRecoveryEntry): boolean {
+  const store = readRecoveryStore();
+  store.drafts[entry.draftId] = entry;
+  const entries = Object.values(store.drafts)
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt))
+    .slice(0, maxRecoveryDrafts);
+  return writeRecoveryStore({
+    version: 1,
+    drafts: Object.fromEntries(entries.map((candidate) => [candidate.draftId, candidate]))
+  });
+}
+
+function isRecoveryNewerThanDraft(entry: DraftRecoveryEntry, draft: DraftRecord): boolean {
+  const recoveryMs = Date.parse(entry.updatedAt);
+  const draftMs = Date.parse(draft.updatedAt);
+  const recoveryBaseMs = Date.parse(entry.serverUpdatedAt ?? "");
+  return Number.isFinite(recoveryMs) &&
+    Number.isFinite(draftMs) &&
+    Number.isFinite(recoveryBaseMs) &&
+    Math.abs(recoveryBaseMs - draftMs) <= recoveryFreshnessToleranceMs &&
+    recoveryMs > draftMs + recoveryFreshnessToleranceMs;
+}
+
+function sendEmergencyDraftSave(entry: DraftRecoveryEntry) {
+  const body = JSON.stringify({
+    name: entry.name,
+    rawMarkdown: entry.rawMarkdown
+  });
+  const url = `/api/drafts/${entry.draftId}/emergency-save`;
+  if (typeof navigator !== "undefined" && navigator.sendBeacon && body.length < 60_000) {
+    navigator.sendBeacon(url, new Blob([body], { type: "application/json" }));
+    return;
+  }
+  void fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body,
+    keepalive: true
+  }).catch(() => undefined);
 }
 
 function download(filename: string, text: string) {
@@ -279,6 +461,74 @@ function draftNameFromUpdateTitle(title: string) {
   return withoutUpdateSuffix || withoutEmoji || "Untitled Update";
 }
 
+let markdownMeasureCanvas: HTMLCanvasElement | undefined;
+
+function measureInputTextWidth(input: HTMLInputElement, text: string) {
+  const canvas = markdownMeasureCanvas ??= document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (!context) return text.length * 8;
+  const style = window.getComputedStyle(input);
+  context.font = `${style.fontStyle} ${style.fontVariant} ${style.fontWeight} ${style.fontSize} / ${style.lineHeight} ${style.fontFamily}`;
+  return context.measureText(text).width;
+}
+
+function isSingleAsteriskAt(value: string, index: number) {
+  return value[index] === "*" && value[index - 1] !== "*" && value[index + 1] !== "*";
+}
+
+function selectedTextHasOwnMarkers(selected: string, marker: InlineFormatMarker) {
+  if (selected.length <= marker.length * 2 || !selected.startsWith(marker) || !selected.endsWith(marker)) return false;
+  if (marker !== "*") return true;
+  return selected[1] !== "*" && selected[selected.length - 2] !== "*";
+}
+
+function selectionHasSurroundingMarkers(value: string, start: number, end: number, marker: InlineFormatMarker) {
+  if (start < marker.length || end + marker.length > value.length) return false;
+  if (marker === "*") {
+    return isSingleAsteriskAt(value, start - 1) && isSingleAsteriskAt(value, end);
+  }
+  return value.slice(start - marker.length, start) === marker && value.slice(end, end + marker.length) === marker;
+}
+
+function applyInlineMarkdownFormat(value: string, start: number, end: number, marker: InlineFormatMarker) {
+  const selected = value.slice(start, end);
+  if (selectedTextHasOwnMarkers(selected, marker)) {
+    const nextSelected = selected.slice(marker.length, selected.length - marker.length);
+    return {
+      value: `${value.slice(0, start)}${nextSelected}${value.slice(end)}`,
+      start,
+      end: start + nextSelected.length
+    };
+  }
+  if (selectionHasSurroundingMarkers(value, start, end, marker)) {
+    const nextStart = start - marker.length;
+    const nextEnd = end - marker.length;
+    return {
+      value: `${value.slice(0, nextStart)}${selected}${value.slice(end + marker.length)}`,
+      start: nextStart,
+      end: nextEnd
+    };
+  }
+  return {
+    value: `${value.slice(0, start)}${marker}${selected}${marker}${value.slice(end)}`,
+    start: start + marker.length,
+    end: end + marker.length
+  };
+}
+
+function getInlineToolbarPosition(input: HTMLInputElement, start: number, end: number) {
+  const rect = input.getBoundingClientRect();
+  const style = window.getComputedStyle(input);
+  const paddingLeft = Number.parseFloat(style.paddingLeft) || 0;
+  const beforeWidth = measureInputTextWidth(input, input.value.slice(0, start));
+  const selectionWidth = measureInputTextWidth(input, input.value.slice(start, end));
+  const rawLeft = rect.left + paddingLeft + beforeWidth + selectionWidth / 2 - input.scrollLeft;
+  return {
+    top: Math.max(8, rect.top - 8),
+    left: Math.min(window.innerWidth - 92, Math.max(92, rawLeft))
+  };
+}
+
 function renderStructuredInlineMarkdown(value: string) {
   const tokens = [
     { marker: "**", className: "mdStrong" },
@@ -290,11 +540,18 @@ function renderStructuredInlineMarkdown(value: string) {
   ];
   const parts: React.ReactNode[] = [];
   let index = 0;
+  let plainStart = 0;
+
+  const flushPlain = (end: number) => {
+    if (end > plainStart) {
+      parts.push(<span key={`plain-${plainStart}-${end}`}>{value.slice(plainStart, end)}</span>);
+    }
+    plainStart = end;
+  };
 
   while (index < value.length) {
     const token = tokens.find((entry) => value.startsWith(entry.marker, index));
     if (!token) {
-      parts.push(value[index]);
       index += 1;
       continue;
     }
@@ -302,17 +559,19 @@ function renderStructuredInlineMarkdown(value: string) {
     const contentStart = index + token.marker.length;
     const contentEnd = value.indexOf(token.marker, contentStart);
     if (contentEnd <= contentStart) {
-      parts.push(value[index]);
       index += 1;
       continue;
     }
 
+    flushPlain(index);
     parts.push(<span key={`m-open-${index}`} className="mdMarker">{token.marker}</span>);
     parts.push(<span key={`m-content-${index}`} className={token.className}>{value.slice(contentStart, contentEnd)}</span>);
     parts.push(<span key={`m-close-${index}`} className="mdMarker">{token.marker}</span>);
     index = contentEnd + token.marker.length;
+    plainStart = index;
   }
 
+  flushPlain(value.length);
   return parts;
 }
 
@@ -329,6 +588,10 @@ const MarkdownTextInput = React.memo(function MarkdownTextInput({
 }) {
   const [localValue, setLocalValue] = useState(value);
   const [isFocused, setIsFocused] = useState(false);
+  const [toolbar, setToolbar] = useState<InlineToolbarState | null>(null);
+  const inputRef = useRef<HTMLInputElement>(null);
+  const toolbarSyncRafRef = useRef<number | null>(null);
+  const pointerSelectingRef = useRef(false);
   const commitTimeoutRef = useRef<number | null>(null);
   const hasPendingCommitRef = useRef(false);
   const latestValueRef = useRef(value);
@@ -371,7 +634,92 @@ const MarkdownTextInput = React.memo(function MarkdownTextInput({
     commitTimeoutRef.current = window.setTimeout(() => commit(next), markdownInputCommitDelayMs);
   };
 
+  const clearToolbarSyncFrame = () => {
+    if (toolbarSyncRafRef.current !== null) {
+      window.cancelAnimationFrame(toolbarSyncRafRef.current);
+      toolbarSyncRafRef.current = null;
+    }
+  };
+
+  const hideToolbar = () => {
+    setToolbar((current) => current === null ? current : null);
+  };
+
+  const syncToolbarToSelection = useCallback((force = false) => {
+    if (pointerSelectingRef.current && !force) return;
+    const input = inputRef.current;
+    if (!input || document.activeElement !== input) {
+      hideToolbar();
+      return;
+    }
+    const start = input.selectionStart ?? 0;
+    const end = input.selectionEnd ?? 0;
+    if (end <= start) {
+      hideToolbar();
+      return;
+    }
+    const position = getInlineToolbarPosition(input, start, end);
+    setToolbar((current) => {
+      if (
+        current &&
+        current.start === start &&
+        current.end === end &&
+        Math.abs(current.top - position.top) < 0.5 &&
+        Math.abs(current.left - position.left) < 0.5
+      ) {
+        return current;
+      }
+      return {
+        ...position,
+        start,
+        end
+      };
+    });
+  }, []);
+
+  const scheduleToolbarSync = useCallback((force = false) => {
+    if (pointerSelectingRef.current && !force) return;
+    if (toolbarSyncRafRef.current !== null) return;
+    toolbarSyncRafRef.current = window.requestAnimationFrame(() => {
+      toolbarSyncRafRef.current = null;
+      syncToolbarToSelection(force);
+    });
+  }, [syncToolbarToSelection]);
+
+  const applyFormat = (marker: InlineFormatMarker) => {
+    const input = inputRef.current;
+    if (!input) return;
+    const start = input.selectionStart ?? toolbar?.start ?? 0;
+    const end = input.selectionEnd ?? toolbar?.end ?? start;
+    if (end <= start) return;
+    const result = applyInlineMarkdownFormat(input.value, start, end, marker);
+    latestValueRef.current = result.value;
+    setLocalValue(result.value);
+    scheduleCommit(result.value);
+    window.requestAnimationFrame(() => {
+      input.focus();
+      input.setSelectionRange(result.start, result.end);
+      syncToolbarToSelection(true);
+    });
+  };
+
+  const beginPointerSelection = (event: React.PointerEvent<HTMLInputElement>) => {
+    if (event.button !== 0) return;
+    pointerSelectingRef.current = true;
+    clearToolbarSyncFrame();
+    hideToolbar();
+    const finishPointerSelection = () => {
+      pointerSelectingRef.current = false;
+      syncToolbarToSelection(true);
+      window.removeEventListener("pointerup", finishPointerSelection);
+      window.removeEventListener("pointercancel", finishPointerSelection);
+    };
+    window.addEventListener("pointerup", finishPointerSelection);
+    window.addEventListener("pointercancel", finishPointerSelection);
+  };
+
   useEffect(() => () => {
+    clearToolbarSyncFrame();
     if (hasPendingCommitRef.current) {
       commit(latestValueRef.current);
     } else {
@@ -380,9 +728,8 @@ const MarkdownTextInput = React.memo(function MarkdownTextInput({
   }, []);
 
   const preview = useMemo(() => {
-    if (isFocused) return null;
     return renderStructuredInlineMarkdown(localValue);
-  }, [isFocused, localValue]);
+  }, [localValue]);
 
   return (
     <span className={`markdownTextInput ${isFocused ? "editing" : ""} ${className ?? ""}`}>
@@ -390,27 +737,65 @@ const MarkdownTextInput = React.memo(function MarkdownTextInput({
         {preview}
       </span>
       <input
+        ref={inputRef}
         className="markdownTextControl"
         value={localValue}
         placeholder={placeholder}
-        onFocus={() => setIsFocused(true)}
+        onFocus={() => {
+          setIsFocused(true);
+          scheduleToolbarSync(true);
+        }}
         onChange={(event) => {
           const nextValue = event.target.value;
           latestValueRef.current = nextValue;
           setLocalValue(nextValue);
           scheduleCommit(nextValue);
+          scheduleToolbarSync(true);
         }}
+        onPointerDown={beginPointerSelection}
+        onSelect={() => scheduleToolbarSync()}
+        onMouseUp={() => scheduleToolbarSync(true)}
+        onKeyUp={() => scheduleToolbarSync(true)}
         onBlur={(event) => {
+          clearToolbarSyncFrame();
+          pointerSelectingRef.current = false;
           commit(event.target.value);
           setIsFocused(false);
+          hideToolbar();
         }}
       />
+      {toolbar && createPortal(
+        <div
+          className="inlineFormatToolbar"
+          style={{ top: toolbar.top, left: toolbar.left }}
+          onMouseDown={(event) => event.preventDefault()}
+          role="toolbar"
+          aria-label="Text formatting"
+        >
+          {inlineMarkdownFormats.map((format) => {
+            const Icon = format.icon;
+            return (
+              <button
+                key={format.id}
+                type="button"
+                title={format.label}
+                aria-label={format.label}
+                onClick={() => applyFormat(format.marker)}
+              >
+                <Icon size={16} strokeWidth={2.3} />
+              </button>
+            );
+          })}
+        </div>,
+        document.body
+      )}
     </span>
   );
 }, (previous, next) =>
   previous.value === next.value &&
   previous.placeholder === next.placeholder &&
-  previous.className === next.className
+  previous.className === next.className &&
+  previous.onChange === next.onChange
 );
 
 type MonacoEditorLike = {
@@ -509,6 +894,47 @@ function RawMarkdownEditor({
   );
 }
 
+function useMarkdownWorker() {
+  const workerRef = useRef<Worker | null>(null);
+  const requestIdRef = useRef(0);
+  const pendingRef = useRef(new Map<number, (response: MarkdownWorkerResponse) => void>());
+
+  useEffect(() => {
+    const worker = new Worker(new URL("./markdownWorker.ts", import.meta.url), { type: "module" });
+    workerRef.current = worker;
+    worker.onmessage = (event: MessageEvent<MarkdownWorkerResponse>) => {
+      const resolve = pendingRef.current.get(event.data.id);
+      if (!resolve) return;
+      pendingRef.current.delete(event.data.id);
+      resolve(event.data);
+    };
+    return () => {
+      worker.terminate();
+      workerRef.current = null;
+      pendingRef.current.clear();
+    };
+  }, []);
+
+  return useCallback((rawMarkdown: string, splitOptions: SplitOptions) => {
+    const id = requestIdRef.current + 1;
+    requestIdRef.current = id;
+    const worker = workerRef.current;
+    if (!worker) {
+      const parsed = parseUpdateLog(rawMarkdown);
+      return Promise.resolve({
+        id,
+        rawMarkdown,
+        parsed,
+        splitResult: emptySplitResult
+      } satisfies MarkdownWorkerResponse);
+    }
+    return new Promise<MarkdownWorkerResponse>((resolve) => {
+      pendingRef.current.set(id, resolve);
+      worker.postMessage({ id, rawMarkdown, splitOptions } satisfies MarkdownWorkerRequest);
+    });
+  }, []);
+}
+
 function App() {
   const [selectedDraftId, setSelectedDraftId] = useState<string>("");
   const [tab, setTab] = useState<EditorTab>("raw");
@@ -516,64 +942,96 @@ function App() {
   const [editorSlideDirection, setEditorSlideDirection] = useState<SlideDirection>("slideForward");
   const [sideSlideDirection, setSideSlideDirection] = useState<SlideDirection>("slideForward");
   const [rawMarkdown, setRawMarkdown] = useState("");
-  const [structured, setStructured] = useState<UpdateLog>({ title: "", sections: [], footer: "" });
+  const [structured, setStructured] = useState<EditableUpdateLog>(() => withUiIds({ title: "", sections: [], footer: "" }));
+  const [splitResult, setSplitResult] = useState<SplitResult>(emptySplitResult);
   const [diagnostics, setDiagnostics] = useState<string[]>([]);
   const [draftName, setDraftName] = useState("");
   const [copyToast, setCopyToast] = useState("");
   const [confirmDeleteDraftId, setConfirmDeleteDraftId] = useState<string | null>(null);
   const [lastManualSaveAt, setLastManualSaveAt] = useState<string>("");
+  const [saveError, setSaveError] = useState("");
+  const [recoveryNotice, setRecoveryNotice] = useState("");
+  const [localRecoveryAt, setLocalRecoveryAt] = useState("");
   const [rawEditorSyncVersion, setRawEditorSyncVersion] = useState(0);
   const hydratedDraftIdRef = useRef("");
-  const rawParseTimeoutRef = useRef<number | null>(null);
-  const [, startRawParseTransition] = useTransition();
+  const markdownAnalysisTimeoutRef = useRef<number | null>(null);
+  const markdownAnalysisGenerationRef = useRef(0);
+  const latestAnalysisRef = useRef<{ rawMarkdown: string; structured: EditableUpdateLog; splitResult: SplitResult } | null>(null);
+  const latestSaveRequestIdRef = useRef(0);
+  const latestAutoVersionRequestIdRef = useRef(0);
+  const lastSavedPayloadKeyRef = useRef("");
+  const lastAutoVersionPayloadKeyRef = useRef("");
+  const latestRecoveryEntryRef = useRef<DraftRecoveryEntry | null>(null);
+  const [, startMarkdownTransition] = useTransition();
+  const analyzeMarkdown = useMarkdownWorker();
   const queryClient = useQueryClient();
 
   const draftsQuery = useQuery({
     queryKey: ["drafts"],
     queryFn: () => api<DraftsResponse>("/api/drafts"),
-    refetchInterval: 4000,
-    refetchIntervalInBackground: true
+    staleTime: 15_000,
+    refetchOnWindowFocus: true
   });
   const settingsQuery = useQuery({
     queryKey: ["settings"],
     queryFn: () => api<SettingsResponse>("/api/settings")
   });
-  useQuery({
-    queryKey: ["codex-status"],
-    queryFn: () => api<any>("/api/codex/status"),
-    refetchOnMount: true,
-    ...codexStatusQueryOptions
+  const activeDraftSummary = draftsQuery.data?.drafts.find((draft) => draft.id === selectedDraftId) ?? draftsQuery.data?.drafts[0];
+  const activeDraftQuery = useQuery({
+    queryKey: ["draft", selectedDraftId],
+    queryFn: () => api<DraftResponse>(`/api/drafts/${selectedDraftId}`),
+    enabled: !!selectedDraftId,
+    staleTime: 10_000
   });
-  const activeDraft = draftsQuery.data?.drafts.find((draft) => draft.id === selectedDraftId) ?? draftsQuery.data?.drafts[0];
+  const activeDraft = activeDraftQuery.data?.draft;
   const draftToDelete = draftsQuery.data?.drafts.find((draft) => draft.id === confirmDeleteDraftId);
   const deferredRawMarkdown = useDeferredValue(rawMarkdown);
-  const deferredStructured = useDeferredValue(structured);
   const customEmojis = settingsQuery.data?.settings.customEmojis ?? [];
   const emojiMap = useMemo(() => buildEmojiMap(customEmojis), [customEmojis]);
+  const splitOptions = useMemo<SplitOptions>(() => {
+    const settings = settingsQuery.data?.settings;
+    return {
+      mode: settings?.characterLimitMode ?? "normal",
+      customLimit: settings?.customLimit,
+      continuationHeaders: settings?.continuationHeaders,
+      title: structured.title,
+      footer: structured.footer
+    };
+  }, [
+    settingsQuery.data?.settings.characterLimitMode,
+    settingsQuery.data?.settings.customLimit,
+    settingsQuery.data?.settings.continuationHeaders,
+    structured.title,
+    structured.footer
+  ]);
 
-  const hydrateDraft = (draft: DraftRecord) => {
+  const hydrateDraft = (draft: DraftRecord, options: { allowRecovery?: boolean } = {}) => {
+    const recovery = options.allowRecovery === false ? undefined : getDraftRecoveryEntry(draft.id);
+    const useRecovery = !!recovery && recovery.rawMarkdown !== draft.rawMarkdown && isRecoveryNewerThanDraft(recovery, draft);
+    const raw = useRecovery ? recovery.rawMarkdown : draft.rawMarkdown;
+    const parsed = useRecovery ? parseUpdateLog(raw).log : draft.structured;
+    const editable = withUiIds(parsed);
     hydratedDraftIdRef.current = draft.id;
-    setRawMarkdown(draft.rawMarkdown);
-    setStructured(draft.structured);
-    setDraftName(draft.name);
-    setDiagnostics(parseUpdateLog(draft.rawMarkdown).diagnostics);
+    setRawMarkdown(raw);
+    setStructured(editable);
+    setDraftName(useRecovery ? recovery.name || draft.name : draft.name);
+    setDiagnostics(parseUpdateLog(raw).diagnostics);
+    latestAnalysisRef.current = { rawMarkdown: raw, structured: editable, splitResult: emptySplitResult };
+    const savedKey = draftPayloadKey(draft.id, draft.name, draft.rawMarkdown, draft.structured);
+    lastSavedPayloadKeyRef.current = savedKey;
+    lastAutoVersionPayloadKeyRef.current = savedKey;
+    setSaveError("");
+    setRecoveryNotice(useRecovery ? `Recovered newer browser copy from ${new Date(recovery.updatedAt).toLocaleString()}. Autosave will write it back to disk.` : "");
     setRawEditorSyncVersion((version) => version + 1);
   };
 
-  const parseRawIntoStructured = useCallback((value: string) => {
-    if (rawParseTimeoutRef.current !== null) {
-      window.clearTimeout(rawParseTimeoutRef.current);
-      rawParseTimeoutRef.current = null;
-    }
-    const parsed = parseUpdateLog(value);
-    startRawParseTransition(() => {
-      setStructured(parsed.log);
-      setDiagnostics(parsed.diagnostics);
-    });
-  }, []);
-
-  const selectDraft = (draft: DraftRecord) => {
+  const selectDraft = (draft: DraftSummary) => {
     if (draft.id === selectedDraftId) return;
+    const recoveryEntry = latestRecoveryEntryRef.current;
+    if (recoveryEntry?.draftId === selectedDraftId) {
+      saveDraftRecoveryEntry({ ...recoveryEntry, updatedAt: new Date().toISOString() });
+      sendEmergencyDraftSave(recoveryEntry);
+    }
     const drafts = draftsQuery.data?.drafts ?? [];
     const currentIndex = drafts.findIndex((entry) => entry.id === selectedDraftId);
     const nextIndex = drafts.findIndex((entry) => entry.id === draft.id);
@@ -581,14 +1039,10 @@ function App() {
     setEditorSlideDirection(direction);
     setSideSlideDirection(direction);
     setSelectedDraftId(draft.id);
-    hydrateDraft(draft);
   };
 
   const switchEditorTab = (next: EditorTab) => {
     if (next === tab) return;
-    if (next === "structured" && tab === "raw") {
-      parseRawIntoStructured(rawMarkdown);
-    }
     setEditorSlideDirection(editorTabOrder.indexOf(next) > editorTabOrder.indexOf(tab) ? "slideForward" : "slideBack");
     setTab(next);
   };
@@ -601,54 +1055,215 @@ function App() {
 
   useEffect(() => {
     if (!selectedDraftId && draftsQuery.data?.drafts[0]) {
-      selectDraft(draftsQuery.data.drafts[0]);
+      setSelectedDraftId(draftsQuery.data.drafts[0].id);
     }
   }, [draftsQuery.data, selectedDraftId]);
 
   useEffect(() => {
-    if (!activeDraft) return;
-    if (activeDraft.id === hydratedDraftIdRef.current) return;
-    hydrateDraft(activeDraft);
-  }, [activeDraft?.id]);
+    if (!activeDraftSummary || selectedDraftId) return;
+    setSelectedDraftId(activeDraftSummary.id);
+  }, [activeDraftSummary, selectedDraftId]);
 
-  useEffect(() => () => {
-    if (rawParseTimeoutRef.current !== null) {
-      window.clearTimeout(rawParseTimeoutRef.current);
+  useEffect(() => {
+    if (!activeDraft) return;
+    if (activeDraft.id === hydratedDraftIdRef.current) {
+      const visibleKey = draftPayloadKey(activeDraft.id, draftName, rawMarkdown, stripUiIds(structured));
+      if (visibleKey !== lastSavedPayloadKeyRef.current) return;
+      if (activeDraft.updatedAt === activeDraftSummary?.updatedAt) return;
     }
+    hydrateDraft(activeDraft);
+  }, [activeDraft?.id, activeDraft?.updatedAt, activeDraftSummary?.updatedAt, draftName, rawMarkdown, structured]);
+
+  useEffect(() => {
+    const generation = markdownAnalysisGenerationRef.current + 1;
+    markdownAnalysisGenerationRef.current = generation;
+    if (markdownAnalysisTimeoutRef.current !== null) {
+      window.clearTimeout(markdownAnalysisTimeoutRef.current);
+    }
+    markdownAnalysisTimeoutRef.current = window.setTimeout(async () => {
+      const response = await analyzeMarkdown(rawMarkdown, splitOptions);
+      if (generation !== markdownAnalysisGenerationRef.current) return;
+      const editable = withUiIds(response.parsed.log);
+      latestAnalysisRef.current = { rawMarkdown: response.rawMarkdown, structured: editable, splitResult: response.splitResult };
+      startMarkdownTransition(() => {
+        if (tab === "raw") setStructured(editable);
+        setDiagnostics(response.parsed.diagnostics);
+        setSplitResult(response.splitResult);
+      });
+    }, markdownWorkerDebounceMs);
+    return () => {
+      if (markdownAnalysisTimeoutRef.current !== null) {
+        window.clearTimeout(markdownAnalysisTimeoutRef.current);
+        markdownAnalysisTimeoutRef.current = null;
+      }
+    };
+  }, [rawMarkdown, splitOptions, analyzeMarkdown, tab]);
+
+  const ensureParsedLog = useCallback(async (): Promise<UpdateLog> => {
+    if (tab !== "raw") return stripUiIds(structured);
+    if (latestAnalysisRef.current?.rawMarkdown === rawMarkdown) {
+      return stripUiIds(latestAnalysisRef.current.structured);
+    }
+    const response = await analyzeMarkdown(rawMarkdown, splitOptions);
+    return response.parsed.log;
+  }, [analyzeMarkdown, rawMarkdown, splitOptions, structured, tab]);
+
+  useEffect(() => {
+    if (!selectedDraftId) {
+      latestRecoveryEntryRef.current = null;
+      return;
+    }
+    if (hydratedDraftIdRef.current !== selectedDraftId) {
+      latestRecoveryEntryRef.current = null;
+      return;
+    }
+    const entry: DraftRecoveryEntry = {
+      draftId: selectedDraftId,
+      name: draftName || "Untitled Update",
+      rawMarkdown,
+      updatedAt: new Date().toISOString(),
+      serverUpdatedAt: activeDraft?.updatedAt
+    };
+    latestRecoveryEntryRef.current = entry;
+    if (saveDraftRecoveryEntry(entry)) setLocalRecoveryAt(entry.updatedAt);
+  }, [activeDraft?.updatedAt, draftName, rawMarkdown, selectedDraftId]);
+
+  useEffect(() => {
+    const flushRecovery = () => {
+      const entry = latestRecoveryEntryRef.current;
+      if (!entry) return;
+      const latestEntry = { ...entry, updatedAt: new Date().toISOString() };
+      latestRecoveryEntryRef.current = latestEntry;
+      saveDraftRecoveryEntry(latestEntry);
+      sendEmergencyDraftSave(latestEntry);
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "hidden") flushRecovery();
+    };
+    window.addEventListener("pagehide", flushRecovery);
+    window.addEventListener("beforeunload", flushRecovery);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => {
+      window.removeEventListener("pagehide", flushRecovery);
+      window.removeEventListener("beforeunload", flushRecovery);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
   }, []);
 
   const saveMutation = useMutation({
-    mutationFn: (payload: { name?: string; rawMarkdown: string; structured: UpdateLog }) =>
-      api<DraftResponse>(`/api/drafts/${selectedDraftId}`, {
+    mutationFn: (payload: { draftId: string; requestId: number; key: string; name?: string; rawMarkdown: string; structured: UpdateLog }) =>
+      api<DraftResponse>(`/api/drafts/${payload.draftId}`, {
         method: "PUT",
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ name: payload.name, rawMarkdown: payload.rawMarkdown, structured: payload.structured })
       }),
-    onSuccess: (data) => {
+    onMutate: () => {
+      setSaveError("");
+    },
+    onSuccess: (data, variables) => {
+      if (variables.requestId !== latestSaveRequestIdRef.current) return;
+      const currentEntry = latestRecoveryEntryRef.current;
+      const responseMatchesEditor = currentEntry?.draftId === variables.draftId &&
+        currentEntry.rawMarkdown === variables.rawMarkdown &&
+        currentEntry.name === (variables.name ?? currentEntry.name);
+      if (responseMatchesEditor) {
+        lastSavedPayloadKeyRef.current = variables.key;
+        setRecoveryNotice("");
+      }
+      queryClient.setQueryData<DraftResponse>(["draft", data.draft.id], data);
       queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
-        if (!previous) return { drafts: [data.draft] };
-        return { drafts: previous.drafts.map((draft) => (draft.id === data.draft.id ? data.draft : draft)) };
+        const summary = draftSummaryFromRecord(data.draft);
+        if (!previous) return { drafts: [summary] };
+        const nextDrafts = previous.drafts.map((draft) => (draft.id === summary.id ? summary : draft));
+        if (!nextDrafts.some((draft) => draft.id === summary.id)) nextDrafts.unshift(summary);
+        return { drafts: nextDrafts };
       });
+    },
+    onError: (error) => {
+      setSaveError(error instanceof Error ? error.message : "Autosave failed.");
+    }
+  });
+
+  const saveAutoVersion = useMutation({
+    mutationFn: (payload: { draftId: string; requestId: number; key: string; name?: string; rawMarkdown: string; structured: UpdateLog }) =>
+      api<SaveVersionResponse>(`/api/drafts/${payload.draftId}/save-version`, {
+        method: "POST",
+        body: JSON.stringify({
+          autosave: true,
+          label: "Autosave",
+          name: payload.name,
+          rawMarkdown: payload.rawMarkdown,
+          structured: payload.structured
+        })
+      }),
+    onMutate: () => {
+      setSaveError("");
+    },
+    onSuccess: (data, variables) => {
+      if (variables.requestId !== latestAutoVersionRequestIdRef.current) return;
+      const currentEntry = latestRecoveryEntryRef.current;
+      const responseMatchesEditor = currentEntry?.draftId === variables.draftId &&
+        currentEntry.rawMarkdown === variables.rawMarkdown &&
+        currentEntry.name === (variables.name ?? currentEntry.name);
+      if (responseMatchesEditor) {
+        lastAutoVersionPayloadKeyRef.current = variables.key;
+        lastSavedPayloadKeyRef.current = variables.key;
+        setRecoveryNotice("");
+      }
+      const summary = draftSummaryFromRecord(data.draft);
+      queryClient.setQueryData<DraftResponse>(["draft", data.draft.id], { draft: data.draft });
+      queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
+        if (!previous) return { drafts: [summary] };
+        const nextDrafts = previous.drafts.map((draft) => (draft.id === summary.id ? summary : draft));
+        if (!nextDrafts.some((draft) => draft.id === summary.id)) nextDrafts.unshift(summary);
+        return { drafts: nextDrafts };
+      });
+      if (data.version) queryClient.invalidateQueries({ queryKey: ["versions", data.draft.id] });
+    },
+    onError: (error) => {
+      setSaveError(error instanceof Error ? error.message : "Autosave backup failed.");
     }
   });
 
   useEffect(() => {
     if (!selectedDraftId || !settingsQuery.data) return;
     const timeout = window.setTimeout(() => {
-      const latestStructured = tab === "raw" ? parseUpdateLog(rawMarkdown).log : structured;
-      saveMutation.mutate({ name: draftName, rawMarkdown, structured: latestStructured });
+      void (async () => {
+        const latestStructured = await ensureParsedLog();
+        const key = draftPayloadKey(selectedDraftId, draftName, rawMarkdown, latestStructured);
+        if (key === lastSavedPayloadKeyRef.current) return;
+        const requestId = latestSaveRequestIdRef.current + 1;
+        latestSaveRequestIdRef.current = requestId;
+        saveMutation.mutate({ draftId: selectedDraftId, requestId, key, name: draftName, rawMarkdown, structured: latestStructured });
+      })();
     }, settingsQuery.data.settings.autosaveIntervalMs);
     return () => window.clearTimeout(timeout);
-  }, [rawMarkdown, structured, draftName, selectedDraftId, tab, settingsQuery.data?.settings.autosaveIntervalMs]);
+  }, [rawMarkdown, structured, draftName, selectedDraftId, settingsQuery.data?.settings.autosaveIntervalMs, ensureParsedLog]);
+
+  useEffect(() => {
+    if (!selectedDraftId || !settingsQuery.data) return;
+    const timeout = window.setTimeout(() => {
+      void (async () => {
+        const latestStructured = await ensureParsedLog();
+        const key = draftPayloadKey(selectedDraftId, draftName, rawMarkdown, latestStructured);
+        if (key === lastAutoVersionPayloadKeyRef.current) return;
+        const requestId = latestAutoVersionRequestIdRef.current + 1;
+        latestAutoVersionRequestIdRef.current = requestId;
+        saveAutoVersion.mutate({ draftId: selectedDraftId, requestId, key, name: draftName, rawMarkdown, structured: latestStructured });
+      })();
+    }, settingsQuery.data.settings.autosaveHistoryIntervalMs);
+    return () => window.clearTimeout(timeout);
+  }, [rawMarkdown, structured, draftName, selectedDraftId, settingsQuery.data?.settings.autosaveHistoryIntervalMs, ensureParsedLog]);
 
   const createDraft = useMutation({
     mutationFn: () => api<DraftResponse>("/api/drafts", { method: "POST", body: JSON.stringify({ name: "Untitled Update" }) }),
     onSuccess: (data) => {
+      const summary = draftSummaryFromRecord(data.draft);
+      queryClient.setQueryData<DraftResponse>(["draft", data.draft.id], data);
       queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
-        if (!previous) return { drafts: [data.draft] };
-        return { drafts: [data.draft, ...previous.drafts.filter((draft) => draft.id !== data.draft.id)] };
+        if (!previous) return { drafts: [summary] };
+        return { drafts: [summary, ...previous.drafts.filter((draft) => draft.id !== data.draft.id)] };
       });
       hydrateDraft(data.draft);
-      queryClient.invalidateQueries({ queryKey: ["drafts"] });
       setSelectedDraftId(data.draft.id);
     }
   });
@@ -656,7 +1271,13 @@ function App() {
   const duplicateDraft = useMutation({
     mutationFn: (id: string) => api<DraftResponse>(`/api/drafts/${id}/duplicate`, { method: "POST" }),
     onSuccess: (data) => {
-      queryClient.invalidateQueries({ queryKey: ["drafts"] });
+      const summary = draftSummaryFromRecord(data.draft);
+      queryClient.setQueryData<DraftResponse>(["draft", data.draft.id], data);
+      queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
+        if (!previous) return { drafts: [summary] };
+        return { drafts: [summary, ...previous.drafts.filter((draft) => draft.id !== summary.id)] };
+      });
+      hydrateDraft(data.draft);
       setSelectedDraftId(data.draft.id);
     }
   });
@@ -672,7 +1293,7 @@ function App() {
       if (selectedDraftId === deletedId) {
         setSelectedDraftId("");
       }
-      queryClient.invalidateQueries({ queryKey: ["drafts"] });
+      queryClient.removeQueries({ queryKey: ["draft", deletedId] });
     }
   });
 
@@ -684,9 +1305,9 @@ function App() {
   });
 
   const saveVersion = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!selectedDraftId) throw new Error("No draft selected.");
-      const latestStructured = tab === "raw" ? parseUpdateLog(rawMarkdown).log : structured;
+      const latestStructured = await ensureParsedLog();
       const nextName = draftNameFromUpdateTitle(latestStructured.title || draftName);
       return api<SaveVersionResponse>(`/api/drafts/${selectedDraftId}/save-version`, {
         method: "POST",
@@ -698,47 +1319,43 @@ function App() {
         })
       });
     },
+    onMutate: () => {
+      setSaveError("");
+    },
     onSuccess: (data) => {
+      const summary = draftSummaryFromRecord(data.draft);
       setDraftName(data.draft.name);
-      setLastManualSaveAt(data.version.createdAt);
+      if (data.version) setLastManualSaveAt(data.version.createdAt);
+      const savedKey = draftPayloadKey(data.draft.id, data.draft.name, data.draft.rawMarkdown, data.draft.structured);
+      lastSavedPayloadKeyRef.current = savedKey;
+      lastAutoVersionPayloadKeyRef.current = savedKey;
+      setRecoveryNotice("");
+      queryClient.setQueryData<DraftResponse>(["draft", data.draft.id], { draft: data.draft });
       queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
-        if (!previous) return { drafts: [data.draft] };
-        const nextDrafts = previous.drafts.map((draft) => (draft.id === data.draft.id ? data.draft : draft));
-        if (!nextDrafts.some((draft) => draft.id === data.draft.id)) nextDrafts.unshift(data.draft);
+        if (!previous) return { drafts: [summary] };
+        const nextDrafts = previous.drafts.map((draft) => (draft.id === summary.id ? summary : draft));
+        if (!nextDrafts.some((draft) => draft.id === summary.id)) nextDrafts.unshift(summary);
         return { drafts: nextDrafts };
       });
-      queryClient.invalidateQueries({ queryKey: ["drafts"] });
       queryClient.invalidateQueries({ queryKey: ["versions", data.draft.id] });
+    },
+    onError: (error) => {
+      setSaveError(error instanceof Error ? error.message : "Manual save failed.");
     }
   });
 
   const updateFromRaw = useCallback((value: string) => {
     setRawMarkdown(value);
-    if (rawParseTimeoutRef.current !== null) {
-      window.clearTimeout(rawParseTimeoutRef.current);
-    }
-    rawParseTimeoutRef.current = window.setTimeout(() => {
-      parseRawIntoStructured(value);
-    }, rawParseDebounceMs);
-  }, [parseRawIntoStructured]);
+  }, []);
 
-  const updateStructured = useCallback((next: UpdateLog) => {
-    setStructured(next);
-    setRawMarkdown(serializeUpdateLog(next));
+  const updateStructured = useCallback((next: EditableUpdateLog) => {
+    const editable = withUiIds(next);
+    const stripped = stripUiIds(editable);
+    setStructured(editable);
+    setRawMarkdown(serializeUpdateLog(stripped));
     setDiagnostics([]);
     setRawEditorSyncVersion((version) => version + 1);
   }, []);
-
-  const splitResult = useMemo(() => {
-    const settings = settingsQuery.data?.settings;
-    return splitDiscordMessages(deferredRawMarkdown, {
-      mode: settings?.characterLimitMode ?? "normal",
-      customLimit: settings?.customLimit,
-      continuationHeaders: settings?.continuationHeaders,
-      title: deferredStructured.title,
-      footer: deferredStructured.footer
-    });
-  }, [deferredRawMarkdown, settingsQuery.data?.settings, deferredStructured.title, deferredStructured.footer]);
 
   const toastCopy = async (text: string, label: string) => {
     await copyText(text);
@@ -746,9 +1363,24 @@ function App() {
     window.setTimeout(() => setCopyToast(""), 1300);
   };
 
+  const currentPayloadKey = selectedDraftId
+    ? draftPayloadKey(selectedDraftId, draftName, rawMarkdown, stripUiIds(structured))
+    : "";
+  const hasUnsavedChanges = !!selectedDraftId && currentPayloadKey !== lastSavedPayloadKeyRef.current;
+  const saveStatusText = saveError
+    ? "Autosave failed; browser recovery is active"
+    : saveMutation.isPending
+      ? "Saving draft..."
+      : saveAutoVersion.isPending
+        ? "Writing backup snapshot..."
+        : hasUnsavedChanges
+          ? "Unsaved edits cached locally"
+          : localRecoveryAt
+            ? `Protected ${new Date(localRecoveryAt).toLocaleTimeString()}`
+            : "Saved";
+
   return (
     <div className="app">
-      <AmbientGlows />
       <aside className="sidebar">
         <div className="brand">
           <Moon size={20} />
@@ -786,6 +1418,7 @@ function App() {
           <input value={draftName} onChange={(event) => setDraftName(event.target.value)} className="titleInput" />
           <div className="actions">
             {copyToast && <span className="toast">{copyToast}</span>}
+            <span className={saveError ? "saveStatus bad" : hasUnsavedChanges ? "saveStatus local" : "saveStatus ok"}>{saveStatusText}</span>
             {activeDraft?.filePath && (
               <button title="Copy Markdown file path" onClick={() => toastCopy(activeDraft.filePath, ".md path copied")}>
                 <FileText size={16} /> Copy .md path
@@ -802,6 +1435,15 @@ function App() {
             </button>
           </div>
         </header>
+
+        {(recoveryNotice || saveError) && (
+          <div className={saveError ? "saveRecoveryBar bad" : "saveRecoveryBar"}>
+            <span>{saveError ? `Server save problem: ${saveError}. A browser recovery copy is still stored locally.` : recoveryNotice}</span>
+            <button className="primary" disabled={!selectedDraftId || saveVersion.isPending} onClick={() => saveVersion.mutate()}>
+              <Save size={15} /> {saveVersion.isPending ? "Saving..." : "Save Now"}
+            </button>
+          </div>
+        )}
 
         <section className="contentGrid">
           <div className="editorPane">
@@ -866,10 +1508,18 @@ function App() {
                 />}
               </div>
               <div className={`sideMode ${sideTab === "ai" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "ai"}>
-                {activeDraft && <AiPanel draftId={activeDraft.id} rawMarkdown={rawMarkdown} structured={structured} customEmojis={customEmojis} onApply={updateStructured} />}
+                {sideTab === "ai" && activeDraft && <AiPanel draftId={activeDraft.id} rawMarkdown={rawMarkdown} structured={stripUiIds(structured)} customEmojis={customEmojis} onApply={(log) => updateStructured(withUiIds(log))} />}
               </div>
               <div className={`sideMode ${sideTab === "history" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "history"}>
-                {sideTab === "history" && activeDraft && <HistoryPanel draftId={activeDraft.id} />}
+                {sideTab === "history" && activeDraft && (
+                  <HistoryPanel
+                    draftId={activeDraft.id}
+                    settings={settingsQuery.data?.settings}
+                    emojiMap={emojiMap}
+                    onCopy={toastCopy}
+                    onRestored={(draft) => hydrateDraft(draft, { allowRecovery: false })}
+                  />
+                )}
               </div>
               <div className={`sideMode ${sideTab === "settings" ? `active ${sideSlideDirection}` : "inactive"}`} aria-hidden={sideTab !== "settings"}>
                 {sideTab === "settings" && settingsQuery.data && <SettingsPanel settings={settingsQuery.data.settings} />}
@@ -916,8 +1566,12 @@ function CustomSelect({
   buttonMeta?: string;
 }) {
   const [menuState, setMenuState] = useState<"closed" | "open" | "closing">("closed");
+  const [menuRect, setMenuRect] = useState<DOMRect | null>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
   const closeTimer = useRef<number | null>(null);
   const selected = options.find((option) => option.value === value) ?? options[0];
+  const visibleOptions = options.slice(0, sectionMenuOptionsLimit);
   const open = menuState === "open";
   const menuVisible = menuState !== "closed";
 
@@ -930,6 +1584,8 @@ function CustomSelect({
 
   const openMenu = () => {
     clearCloseTimer();
+    const rect = buttonRef.current?.getBoundingClientRect();
+    if (rect) setMenuRect(rect);
     setMenuState("open");
   };
 
@@ -945,20 +1601,100 @@ function CustomSelect({
 
   useEffect(() => () => clearCloseTimer(), []);
 
-  return (
+  useEffect(() => {
+    if (!menuVisible) return;
+    const updatePosition = () => {
+      const rect = buttonRef.current?.getBoundingClientRect();
+      if (rect) setMenuRect(rect);
+    };
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (!target) return;
+      if (buttonRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      closeMenu();
+    };
+    window.addEventListener("resize", updatePosition);
+    window.addEventListener("scroll", updatePosition, true);
+    window.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => {
+      window.removeEventListener("resize", updatePosition);
+      window.removeEventListener("scroll", updatePosition, true);
+      window.removeEventListener("pointerdown", closeOnOutsidePointer);
+    };
+  }, [menuVisible, menuState]);
+
+  const focusOption = (index: number) => {
+    const buttons = menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='option']");
+    buttons?.[Math.max(0, Math.min(index, buttons.length - 1))]?.focus();
+  };
+
+  const selectOption = (option: SelectOption) => {
+    onChange(option.value);
+    closeMenu();
+    window.requestAnimationFrame(() => buttonRef.current?.focus());
+  };
+
+  const menu = menuVisible && menuRect ? createPortal(
     <div
-      className={`${compact ? "customSelect compact" : "customSelect"}${dense ? " dense" : ""}`}
-      onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+      ref={menuRef}
+      className={menuState === "closing" ? "customSelectMenu closing portal" : "customSelectMenu open portal"}
+      style={{
+        left: menuRect.left,
+        top: menuRect.bottom + 4,
+        width: menuRect.width
+      }}
+      tabIndex={-1}
+      role="listbox"
+      aria-label={label ?? buttonLabel ?? "Select option"}
+      onKeyDown={(event) => {
+        if (event.key === "Escape") {
+          event.preventDefault();
           closeMenu();
+          buttonRef.current?.focus();
+        }
+        if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+          event.preventDefault();
+          const buttons = [...(menuRef.current?.querySelectorAll<HTMLButtonElement>("[role='option']") ?? [])];
+          const currentIndex = buttons.findIndex((button) => button === document.activeElement);
+          focusOption(event.key === "ArrowDown" ? currentIndex + 1 : currentIndex - 1);
         }
       }}
     >
+      {visibleOptions.map((option) => (
+        <button
+          type="button"
+          key={option.value}
+          className={option.value === value ? "selected" : ""}
+          role="option"
+          aria-selected={option.value === value}
+          onMouseDown={(event) => event.preventDefault()}
+          onClick={() => selectOption(option)}
+        >
+          <span>{option.label}</span>
+          {option.meta && <small>{option.meta}</small>}
+        </button>
+      ))}
+    </div>,
+    document.body
+  ) : null;
+
+  return (
+    <div className={`${compact ? "customSelect compact" : "customSelect"}${dense ? " dense" : ""}`}>
       {label && <span className="customSelectLabel">{label}</span>}
       <button
+        ref={buttonRef}
         type="button"
         className={open ? "customSelectButton open" : "customSelectButton"}
+        aria-haspopup="listbox"
+        aria-expanded={open}
         onClick={() => (open ? closeMenu() : openMenu())}
+        onKeyDown={(event) => {
+          if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            openMenu();
+            window.requestAnimationFrame(() => focusOption(Math.max(0, visibleOptions.findIndex((option) => option.value === value))));
+          }
+        }}
       >
         <span>
           <strong>{buttonLabel ?? selected?.label ?? "Select"}</strong>
@@ -966,25 +1702,7 @@ function CustomSelect({
         </span>
         <ChevronDown size={15} className="chevron" />
       </button>
-      {menuVisible && (
-        <div className={menuState === "closing" ? "customSelectMenu closing" : "customSelectMenu open"} tabIndex={-1}>
-          {options.slice(0, sectionMenuOptionsLimit).map((option) => (
-            <button
-              type="button"
-              key={option.value}
-              className={option.value === value ? "selected" : ""}
-              onMouseDown={(event) => event.preventDefault()}
-              onClick={() => {
-                onChange(option.value);
-                closeMenu();
-              }}
-            >
-              <span>{option.label}</span>
-              {option.meta && <small>{option.meta}</small>}
-            </button>
-          ))}
-        </div>
-      )}
+      {menu}
     </div>
   );
 }
@@ -996,8 +1714,8 @@ const StructuredEditor = React.memo(function StructuredEditor({
   isSaving,
   lastSavedAt
 }: {
-  log: UpdateLog;
-  onChange: (log: UpdateLog) => void;
+  log: EditableUpdateLog;
+  onChange: (log: EditableUpdateLog) => void;
   onSave: () => void;
   isSaving: boolean;
   lastSavedAt: string;
@@ -1008,10 +1726,16 @@ const StructuredEditor = React.memo(function StructuredEditor({
   const structuredRef = useRef<HTMLDivElement>(null);
   const collapsedSectionsRef = useRef<Set<number>>(new Set());
   const localLogRef = useRef(log);
-  const lastPropagatedLogRef = useRef<UpdateLog | null>(null);
+  const lastPropagatedLogRef = useRef<EditableUpdateLog | null>(null);
   const commitTimeoutRef = useRef<number | null>(null);
+  const sectionDragSessionRef = useRef<SectionDragSession | null>(null);
   const bulletDragSessionRef = useRef<BulletDragSession | null>(null);
+  const activeSectionIndexRef = useRef(activeSectionIndex);
   localLogRef.current = localLog;
+
+  useEffect(() => {
+    activeSectionIndexRef.current = activeSectionIndex;
+  }, [activeSectionIndex]);
 
   useEffect(() => {
     if (log === lastPropagatedLogRef.current) return;
@@ -1025,7 +1749,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
     }
   }, []);
 
-  const commitLog = (next: UpdateLog, immediate = false) => {
+  const commitLog = (next: EditableUpdateLog, immediate = false) => {
     if (commitTimeoutRef.current !== null) {
       window.clearTimeout(commitTimeoutRef.current);
       commitTimeoutRef.current = null;
@@ -1048,16 +1772,21 @@ const StructuredEditor = React.memo(function StructuredEditor({
   }));
   const clampedActiveSectionIndex = Math.min(activeSectionIndex, Math.max(0, localLog.sections.length - 1));
 
-  const setLog = (mutator: (draft: UpdateLog) => void, immediate = false) => {
-    const next = cloneLog(localLogRef.current);
+  const setLog = (mutator: (draft: EditableUpdateLog) => void, immediate = false) => {
+    const next = cloneEditableLog(localLogRef.current);
     mutator(next);
     applyLocalLog(next, immediate);
   };
 
-  const applyLocalLog = (next: UpdateLog, immediate = false) => {
-    localLogRef.current = next;
-    setLocalLog(next);
-    commitLog(next, immediate);
+  const applyLocalLog = (next: EditableUpdateLog, immediate = false) => {
+    const editable = withUiIds(next);
+    localLogRef.current = editable;
+    setLocalLog(editable);
+    commitLog(editable, immediate);
+  };
+
+  const flushLocalLog = () => {
+    commitLog(localLogRef.current, true);
   };
 
   const updateTitle = (value: string) => {
@@ -1111,13 +1840,6 @@ const StructuredEditor = React.memo(function StructuredEditor({
     applyLocalLog({ ...localLogRef.current, footer: value });
   };
 
-  const moveSection = (index: number, direction: -1 | 1) => setLog((draft) => {
-    const target = index + direction;
-    if (target < 0 || target >= draft.sections.length) return;
-    const [section] = draft.sections.splice(index, 1);
-    draft.sections.splice(target, 0, section);
-  }, true);
-
   const moveItem = (sectionIndex: number, itemIndex: number, direction: -1 | 1) => setLog((draft) => {
     const items = draft.sections[sectionIndex].items;
     const target = itemIndex + direction;
@@ -1133,6 +1855,270 @@ const StructuredEditor = React.memo(function StructuredEditor({
     draft.sections[targetSectionIndex].items.push(item);
   }, true);
 
+  const getSectionInsertIndex = (sourceIndex: number, target: SectionDropTarget, sectionCount: number) => {
+    if (sourceIndex < 0 || sourceIndex >= sectionCount) return sourceIndex;
+    let insertIndex = target.side === "after" ? target.sectionIndex + 1 : target.sectionIndex;
+    if (sourceIndex < insertIndex) insertIndex -= 1;
+    return Math.max(0, Math.min(insertIndex, sectionCount - 1));
+  };
+
+  const remapMovedSectionIndex = (index: number, sourceIndex: number, insertIndex: number) => {
+    if (index === sourceIndex) return insertIndex;
+    if (sourceIndex < insertIndex && index > sourceIndex && index <= insertIndex) return index - 1;
+    if (sourceIndex > insertIndex && index >= insertIndex && index < sourceIndex) return index + 1;
+    return index;
+  };
+
+  const remapCollapsedSections = (sourceIndex: number, insertIndex: number) => {
+    if (!collapsedSectionsRef.current.size) return;
+    collapsedSectionsRef.current = new Set(
+      [...collapsedSectionsRef.current].map((index) => remapMovedSectionIndex(index, sourceIndex, insertIndex))
+    );
+  };
+
+  const clearSectionDropTarget = (session: SectionDragSession) => {
+    session.targetElement?.classList.remove("dragTarget-before", "dragTarget-after");
+    session.targetElement = null;
+    session.target = null;
+  };
+
+  const readSectionLocation = (element: Element | null): SectionDragLocation | null => {
+    if (!(element instanceof HTMLElement)) return null;
+    const sectionIndex = Number(element.dataset.sectionIndex);
+    const sectionUiId = element.dataset.sectionUiId;
+    if (!Number.isInteger(sectionIndex) || !sectionUiId) return null;
+    return { sectionIndex, sectionUiId };
+  };
+
+  const getSectionDropTarget = (clientX: number, clientY: number): { target: SectionDropTarget; element: HTMLElement | null } | null => {
+    const hit = document.elementFromPoint(clientX, clientY);
+    const sectionElement = hit?.closest<HTMLElement>(".sectionEditor[data-section-index]");
+    if (!sectionElement) return null;
+    const location = readSectionLocation(sectionElement);
+    if (!location) return null;
+    const rect = sectionElement.getBoundingClientRect();
+    return {
+      target: {
+        ...location,
+        side: clientY < rect.top + rect.height / 2 ? "before" : "after"
+      },
+      element: sectionElement
+    };
+  };
+
+  const setSectionDropTargetDom = (session: SectionDragSession, next: { target: SectionDropTarget; element: HTMLElement | null } | null) => {
+    const current = session.target;
+    const sameTarget = current && next &&
+      current.sectionUiId === next.target.sectionUiId &&
+      current.sectionIndex === next.target.sectionIndex &&
+      current.side === next.target.side &&
+      session.targetElement === next.element;
+    if (sameTarget) return;
+    clearSectionDropTarget(session);
+    clearDragShiftPreview(session);
+    if (!next) return;
+    session.target = next.target;
+    session.targetElement = next.element;
+    next.element?.classList.add(`dragTarget-${next.target.side}`);
+    applySectionDragPreview(session, next.target);
+  };
+
+  const updateDragElementPosition = (session: Pick<SectionDragSession | BulletDragSession, "element" | "pointerY" | "dragOffsetY" | "dragTranslateY">) => {
+    const rect = session.element.getBoundingClientRect();
+    const layoutTop = rect.top - session.dragTranslateY;
+    const nextTranslateY = session.pointerY - session.dragOffsetY - layoutTop;
+    session.dragTranslateY = nextTranslateY;
+    session.element.style.setProperty("--drag-y", `${nextTranslateY}px`);
+  };
+
+  const releasePointerCapture = (session: Pick<SectionDragSession | BulletDragSession, "handleElement" | "pointerId">) => {
+    try {
+      if (session.handleElement.hasPointerCapture(session.pointerId)) {
+        session.handleElement.releasePointerCapture(session.pointerId);
+      }
+    } catch {
+      // Some browsers release pointer capture automatically when the source node moves.
+    }
+  };
+
+  const getOuterBlockHeight = (element: HTMLElement) => {
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    return rect.height + (Number.parseFloat(style.marginTop) || 0) + (Number.parseFloat(style.marginBottom) || 0);
+  };
+
+  const clearDragShiftPreview = (session: Pick<SectionDragSession | BulletDragSession, "shiftedElements">) => {
+    session.shiftedElements.forEach((element) => {
+      element.classList.remove("dragShift");
+      element.style.removeProperty("--drag-shift-y");
+    });
+    session.shiftedElements.clear();
+  };
+
+  const shiftDragPreviewElement = (session: Pick<SectionDragSession | BulletDragSession, "element" | "shiftedElements">, element: HTMLElement, offsetY: number) => {
+    if (element === session.element) return;
+    element.classList.add("dragShift");
+    element.style.setProperty("--drag-shift-y", `${offsetY}px`);
+    session.shiftedElements.add(element);
+  };
+
+  const applySectionDragPreview = (session: SectionDragSession, target: SectionDropTarget) => {
+    const current = localLogRef.current;
+    const sourceIndex = current.sections.findIndex((section) => section.uiId === session.source.sectionUiId);
+    const targetIndex = current.sections.findIndex((section) => section.uiId === target.sectionUiId);
+    if (sourceIndex < 0 || targetIndex < 0) return false;
+    const insertIndex = getSectionInsertIndex(sourceIndex, { ...target, sectionIndex: targetIndex }, current.sections.length);
+    if (insertIndex === sourceIndex) return false;
+    const shiftBy = getOuterBlockHeight(session.element);
+    const lowerIndex = insertIndex > sourceIndex ? sourceIndex + 1 : insertIndex;
+    const upperIndex = insertIndex > sourceIndex ? insertIndex : sourceIndex - 1;
+    const offsetY = insertIndex > sourceIndex ? -shiftBy : shiftBy;
+    structuredRef.current?.querySelectorAll<HTMLElement>(".sectionEditor[data-section-index]").forEach((sectionElement) => {
+      const sectionIndex = Number(sectionElement.dataset.sectionIndex);
+      if (sectionIndex >= lowerIndex && sectionIndex <= upperIndex) {
+        shiftDragPreviewElement(session, sectionElement, offsetY);
+      }
+    });
+    return true;
+  };
+
+  const reorderSection = (source: SectionDragLocation, target: SectionDropTarget) => {
+    const current = localLogRef.current;
+    const sourceIndex = current.sections.findIndex((section) => section.uiId === source.sectionUiId);
+    const targetIndex = current.sections.findIndex((section) => section.uiId === target.sectionUiId);
+    if (sourceIndex < 0 || targetIndex < 0) return false;
+    const insertIndex = getSectionInsertIndex(sourceIndex, { ...target, sectionIndex: targetIndex }, current.sections.length);
+    if (insertIndex === sourceIndex) return false;
+    setLog((draft) => {
+      const draftSourceIndex = draft.sections.findIndex((section) => section.uiId === source.sectionUiId);
+      const draftTargetIndex = draft.sections.findIndex((section) => section.uiId === target.sectionUiId);
+      if (draftSourceIndex < 0 || draftTargetIndex < 0) return;
+      const draftInsertIndex = getSectionInsertIndex(draftSourceIndex, { ...target, sectionIndex: draftTargetIndex }, draft.sections.length);
+      const [section] = draft.sections.splice(draftSourceIndex, 1);
+      draft.sections.splice(draftInsertIndex, 0, section);
+    }, true);
+    remapCollapsedSections(sourceIndex, insertIndex);
+    setActiveSectionIndex((index) => {
+      const nextIndex = remapMovedSectionIndex(index, sourceIndex, insertIndex);
+      activeSectionIndexRef.current = nextIndex;
+      return nextIndex;
+    });
+    return true;
+  };
+
+  const finishSectionDrag = (commit: boolean) => {
+    const session = sectionDragSessionRef.current;
+    if (!session) return;
+    const finalTarget = session.target;
+    sectionDragSessionRef.current = null;
+    window.removeEventListener("pointermove", session.onPointerMove);
+    window.removeEventListener("pointerup", session.onPointerUp);
+    window.removeEventListener("pointercancel", session.onPointerCancel);
+    if (session.rafId !== null) window.cancelAnimationFrame(session.rafId);
+    if (session.autoScrollRafId !== null) window.cancelAnimationFrame(session.autoScrollRafId);
+    clearSectionDropTarget(session);
+    clearDragShiftPreview(session);
+    releasePointerCapture(session);
+    session.element.classList.remove("dragging");
+    session.element.style.removeProperty("--drag-y");
+    structuredRef.current?.classList.remove("dragActive");
+    if (commit && finalTarget) {
+      reorderSection(session.source, finalTarget);
+    }
+  };
+
+  const scheduleSectionDragFrame = (session: SectionDragSession) => {
+    if (session.rafId !== null) return;
+    session.rafId = window.requestAnimationFrame(() => {
+      session.rafId = null;
+      updateDragElementPosition(session);
+      const nextTarget = getSectionDropTarget(session.pointerX, session.pointerY);
+      setSectionDropTargetDom(session, nextTarget);
+    });
+  };
+
+  const runSectionAutoScroll = (session: SectionDragSession) => {
+    const container = structuredRef.current;
+    if (!container || sectionDragSessionRef.current !== session) return;
+    const rect = container.getBoundingClientRect();
+    const edgeSize = 96;
+    const topDistance = session.pointerY - rect.top;
+    const bottomDistance = rect.bottom - session.pointerY;
+    let scrollDelta = 0;
+    if (topDistance < edgeSize) {
+      scrollDelta = -Math.round(((edgeSize - topDistance) / edgeSize) * 18);
+    } else if (bottomDistance < edgeSize) {
+      scrollDelta = Math.round(((edgeSize - bottomDistance) / edgeSize) * 18);
+    }
+    if (scrollDelta !== 0) {
+      container.scrollTop += scrollDelta;
+      scheduleSectionDragFrame(session);
+    }
+    session.autoScrollRafId = window.requestAnimationFrame(() => runSectionAutoScroll(session));
+  };
+
+  const beginSectionDrag = (event: React.PointerEvent<HTMLButtonElement>, location: SectionDragLocation) => {
+    if (event.button !== 0) return;
+    const sectionElement = event.currentTarget.closest<HTMLElement>(".sectionEditor");
+    if (!sectionElement) return;
+    event.preventDefault();
+    event.stopPropagation();
+    finishBulletDrag(false);
+    finishSectionDrag(false);
+    flushLocalLog();
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is a best-effort assist; window listeners still drive the drag.
+    }
+    const onPointerMove = (moveEvent: PointerEvent) => {
+      const activeSession = sectionDragSessionRef.current;
+      if (!activeSession || moveEvent.pointerId !== activeSession.pointerId) return;
+      moveEvent.preventDefault();
+      activeSession.pointerX = moveEvent.clientX;
+      activeSession.pointerY = moveEvent.clientY;
+      scheduleSectionDragFrame(activeSession);
+    };
+    const onPointerUp = (upEvent: PointerEvent) => {
+      const activeSession = sectionDragSessionRef.current;
+      if (!activeSession || upEvent.pointerId !== activeSession.pointerId) return;
+      finishSectionDrag(true);
+    };
+    const onPointerCancel = (cancelEvent: PointerEvent) => {
+      const activeSession = sectionDragSessionRef.current;
+      if (!activeSession || cancelEvent.pointerId !== activeSession.pointerId) return;
+      finishSectionDrag(false);
+    };
+    const rect = sectionElement.getBoundingClientRect();
+    const session: SectionDragSession = {
+      source: location,
+      element: sectionElement,
+      handleElement: event.currentTarget,
+      pointerId: event.pointerId,
+      dragOffsetY: event.clientY - rect.top,
+      dragTranslateY: 0,
+      pointerX: event.clientX,
+      pointerY: event.clientY,
+      target: null,
+      targetElement: null,
+      shiftedElements: new Set(),
+      rafId: null,
+      autoScrollRafId: null,
+      onPointerMove,
+      onPointerUp,
+      onPointerCancel
+    };
+    sectionDragSessionRef.current = session;
+    sectionElement.style.setProperty("--drag-y", "0px");
+    sectionElement.classList.add("dragging");
+    structuredRef.current?.classList.add("dragActive");
+    window.addEventListener("pointermove", onPointerMove);
+    window.addEventListener("pointerup", onPointerUp);
+    window.addEventListener("pointercancel", onPointerCancel);
+    setSectionDropTargetDom(session, getSectionDropTarget(event.clientX, event.clientY));
+    session.autoScrollRafId = window.requestAnimationFrame(() => runSectionAutoScroll(session));
+  };
+
   const clearBulletDropTarget = (session: BulletDragSession) => {
     session.targetElement?.classList.remove("dragTarget-before", "dragTarget-after");
     session.targetElement = null;
@@ -1143,8 +2129,10 @@ const StructuredEditor = React.memo(function StructuredEditor({
     if (!(element instanceof HTMLElement)) return null;
     const sectionIndex = Number(element.dataset.sectionIndex);
     const itemIndex = Number(element.dataset.itemIndex);
-    if (!Number.isInteger(sectionIndex) || !Number.isInteger(itemIndex)) return null;
-    return { sectionIndex, itemIndex };
+    const sectionUiId = element.dataset.sectionUiId;
+    const itemUiId = element.dataset.itemUiId;
+    if (!Number.isInteger(sectionIndex) || !Number.isInteger(itemIndex) || !sectionUiId || !itemUiId) return null;
+    return { sectionIndex, sectionUiId, itemIndex, itemUiId };
   };
 
   const getBulletDropTarget = (clientX: number, clientY: number): { target: BulletDropTarget; element: HTMLElement | null } | null => {
@@ -1166,11 +2154,12 @@ const StructuredEditor = React.memo(function StructuredEditor({
     const sectionElement = hit?.closest<HTMLElement>(".sectionEditor[data-section-index]");
     if (!sectionElement) return null;
     const sectionIndex = Number(sectionElement.dataset.sectionIndex);
-    if (!Number.isInteger(sectionIndex)) return null;
+    const sectionUiId = sectionElement.dataset.sectionUiId;
+    if (!Number.isInteger(sectionIndex) || !sectionUiId) return null;
     const itemElements = [...sectionElement.querySelectorAll<HTMLElement>(".itemEditor[data-section-index][data-item-index]")];
     if (!itemElements.length) {
       return {
-        target: { sectionIndex, itemIndex: 0, side: "after" },
+        target: { sectionIndex, sectionUiId, itemIndex: 0, side: "after" },
         element: sectionElement.querySelector<HTMLElement>(".sectionBodyInner")
       };
     }
@@ -1201,39 +2190,104 @@ const StructuredEditor = React.memo(function StructuredEditor({
   const setBulletDropTargetDom = (session: BulletDragSession, next: { target: BulletDropTarget; element: HTMLElement | null } | null) => {
     const current = session.target;
     const sameTarget = current && next &&
+      current.sectionUiId === next.target.sectionUiId &&
       current.sectionIndex === next.target.sectionIndex &&
+      current.itemUiId === next.target.itemUiId &&
       current.itemIndex === next.target.itemIndex &&
       current.side === next.target.side &&
       session.targetElement === next.element;
     if (sameTarget) return;
     clearBulletDropTarget(session);
+    clearDragShiftPreview(session);
     if (!next) return;
     session.target = next.target;
     session.targetElement = next.element;
     next.element?.classList.add(`dragTarget-${next.target.side}`);
+    applyBulletDragPreview(session, next.target);
+  };
+
+  const getBulletMove = (log: EditableUpdateLog, source: BulletDragLocation, target: BulletDropTarget) => {
+    const sourceSectionIndex = log.sections.findIndex((section) => section.uiId === source.sectionUiId);
+    const targetSectionIndex = log.sections.findIndex((section) => section.uiId === target.sectionUiId);
+    if (sourceSectionIndex < 0 || targetSectionIndex < 0) return false;
+    const sourceItems = log.sections[sourceSectionIndex].items;
+    const sourceItemIndex = sourceItems.findIndex((item) => item.uiId === source.itemUiId);
+    if (sourceItemIndex < 0) return false;
+    const targetItems = log.sections[targetSectionIndex].items;
+    const targetItemIndex = target.itemUiId
+      ? targetItems.findIndex((item) => item.uiId === target.itemUiId)
+      : Math.min(target.itemIndex, targetItems.length);
+    if (targetItemIndex < 0) return false;
+    let insertIndex = target.side === "after" ? targetItemIndex + 1 : targetItemIndex;
+    if (sourceSectionIndex === targetSectionIndex && sourceItemIndex < insertIndex) {
+      insertIndex -= 1;
+    }
+    insertIndex = Math.max(0, Math.min(insertIndex, sourceSectionIndex === targetSectionIndex ? targetItems.length - 1 : targetItems.length));
+    if (sourceSectionIndex === targetSectionIndex && insertIndex === sourceItemIndex) return false;
+    return { sourceSectionIndex, sourceItemIndex, targetSectionIndex, insertIndex };
+  };
+
+  const queryBulletElements = (sectionUiId: string) => {
+    const root = structuredRef.current;
+    if (!root) return [];
+    return [...root.querySelectorAll<HTMLElement>(`.itemEditor[data-section-ui-id="${sectionUiId}"]`)];
+  };
+
+  const applyBulletDragPreview = (session: BulletDragSession, target: BulletDropTarget) => {
+    const move = getBulletMove(localLogRef.current, session.source, target);
+    if (!move) return false;
+    const shiftBy = getOuterBlockHeight(session.element);
+    const { sourceSectionIndex, sourceItemIndex, targetSectionIndex, insertIndex } = move;
+    if (sourceSectionIndex === targetSectionIndex) {
+      const sectionUiId = localLogRef.current.sections[sourceSectionIndex].uiId;
+      const lowerIndex = insertIndex > sourceItemIndex ? sourceItemIndex + 1 : insertIndex;
+      const upperIndex = insertIndex > sourceItemIndex ? insertIndex : sourceItemIndex - 1;
+      const offsetY = insertIndex > sourceItemIndex ? -shiftBy : shiftBy;
+      for (const itemElement of queryBulletElements(sectionUiId)) {
+        const itemIndex = Number(itemElement.dataset.itemIndex);
+        if (itemIndex >= lowerIndex && itemIndex <= upperIndex) {
+          shiftDragPreviewElement(session, itemElement, offsetY);
+        }
+      }
+      return true;
+    }
+
+    const sourceSectionUiId = localLogRef.current.sections[sourceSectionIndex].uiId;
+    const targetSectionUiId = localLogRef.current.sections[targetSectionIndex].uiId;
+    for (const itemElement of queryBulletElements(sourceSectionUiId)) {
+      const itemIndex = Number(itemElement.dataset.itemIndex);
+      if (itemIndex > sourceItemIndex) {
+        shiftDragPreviewElement(session, itemElement, -shiftBy);
+      }
+    }
+    for (const itemElement of queryBulletElements(targetSectionUiId)) {
+      const itemIndex = Number(itemElement.dataset.itemIndex);
+      if (itemIndex >= insertIndex) {
+        shiftDragPreviewElement(session, itemElement, shiftBy);
+      }
+    }
+    return true;
   };
 
   const reorderBullet = (source: BulletDragLocation, target: BulletDropTarget) => {
+    const move = getBulletMove(localLogRef.current, source, target);
+    if (!move) return false;
+    const nextActiveSectionIndex = move.targetSectionIndex;
     setLog((draft) => {
-      const sourceSection = draft.sections[source.sectionIndex];
-      const targetSection = draft.sections[target.sectionIndex];
-      if (!sourceSection || !targetSection) return;
-      const sourceItems = sourceSection.items;
-      if (source.itemIndex < 0 || source.itemIndex >= sourceItems.length) return;
-      let insertIndex = target.side === "after" ? target.itemIndex + 1 : target.itemIndex;
-      const [item] = sourceItems.splice(source.itemIndex, 1);
-      const targetItems = targetSection.items;
-      if (source.sectionIndex === target.sectionIndex && source.itemIndex < insertIndex) {
-        insertIndex -= 1;
-      }
-      insertIndex = Math.max(0, Math.min(insertIndex, targetItems.length));
-      targetItems.splice(insertIndex, 0, item);
+      const draftMove = getBulletMove(draft, source, target);
+      if (!draftMove) return;
+      const [item] = draft.sections[draftMove.sourceSectionIndex].items.splice(draftMove.sourceItemIndex, 1);
+      draft.sections[draftMove.targetSectionIndex].items.splice(draftMove.insertIndex, 0, item);
     }, true);
+    activeSectionIndexRef.current = nextActiveSectionIndex;
+    setActiveSectionIndex(nextActiveSectionIndex);
+    return true;
   };
 
   const finishBulletDrag = (commit: boolean) => {
     const session = bulletDragSessionRef.current;
     if (!session) return;
+    const finalTarget = session.target;
     bulletDragSessionRef.current = null;
     window.removeEventListener("pointermove", session.onPointerMove);
     window.removeEventListener("pointerup", session.onPointerUp);
@@ -1241,11 +2295,13 @@ const StructuredEditor = React.memo(function StructuredEditor({
     if (session.rafId !== null) window.cancelAnimationFrame(session.rafId);
     if (session.autoScrollRafId !== null) window.cancelAnimationFrame(session.autoScrollRafId);
     clearBulletDropTarget(session);
+    clearDragShiftPreview(session);
+    releasePointerCapture(session);
     session.element.classList.remove("dragging");
     session.element.style.removeProperty("--drag-y");
     structuredRef.current?.classList.remove("dragActive");
-    if (commit && session.target) {
-      reorderBullet(session.source, session.target);
+    if (commit && finalTarget) {
+      reorderBullet(session.source, finalTarget);
     }
   };
 
@@ -1253,9 +2309,9 @@ const StructuredEditor = React.memo(function StructuredEditor({
     if (session.rafId !== null) return;
     session.rafId = window.requestAnimationFrame(() => {
       session.rafId = null;
-      const scrollDelta = (structuredRef.current?.scrollTop ?? session.scrollStartTop) - session.scrollStartTop;
-      session.element.style.setProperty("--drag-y", `${session.pointerY - session.pointerStartY + scrollDelta}px`);
-      setBulletDropTargetDom(session, getBulletDropTarget(session.pointerX, session.pointerY));
+      updateDragElementPosition(session);
+      const nextTarget = getBulletDropTarget(session.pointerX, session.pointerY);
+      setBulletDropTargetDom(session, nextTarget);
     });
   };
 
@@ -1286,9 +2342,17 @@ const StructuredEditor = React.memo(function StructuredEditor({
     event.preventDefault();
     event.stopPropagation();
     finishBulletDrag(false);
+    finishSectionDrag(false);
+    flushLocalLog();
+    try {
+      event.currentTarget.setPointerCapture(event.pointerId);
+    } catch {
+      // Pointer capture is a best-effort assist; window listeners still drive the drag.
+    }
     const onPointerMove = (moveEvent: PointerEvent) => {
       const activeSession = bulletDragSessionRef.current;
       if (!activeSession || moveEvent.pointerId !== activeSession.pointerId) return;
+      moveEvent.preventDefault();
       activeSession.pointerX = moveEvent.clientX;
       activeSession.pointerY = moveEvent.clientY;
       scheduleBulletDragFrame(activeSession);
@@ -1303,16 +2367,19 @@ const StructuredEditor = React.memo(function StructuredEditor({
       if (!activeSession || cancelEvent.pointerId !== activeSession.pointerId) return;
       finishBulletDrag(false);
     };
+    const rect = itemElement.getBoundingClientRect();
     const session: BulletDragSession = {
       source: location,
       element: itemElement,
+      handleElement: event.currentTarget,
       pointerId: event.pointerId,
-      pointerStartY: event.clientY,
-      scrollStartTop: structuredRef.current?.scrollTop ?? 0,
+      dragOffsetY: event.clientY - rect.top,
+      dragTranslateY: 0,
       pointerX: event.clientX,
       pointerY: event.clientY,
       target: null,
       targetElement: null,
+      shiftedElements: new Set(),
       rafId: null,
       autoScrollRafId: null,
       onPointerMove,
@@ -1331,14 +2398,15 @@ const StructuredEditor = React.memo(function StructuredEditor({
   };
 
   useEffect(() => () => {
+    finishSectionDrag(false);
     finishBulletDrag(false);
   }, []);
 
   const addBulletToSection = (sectionIndex = clampedActiveSectionIndex) => setLog((draft) => {
     if (!draft.sections[sectionIndex]) {
-      draft.sections.push({ title: "GENERAL", items: [] });
+      draft.sections.push({ uiId: createUiId("section"), title: "GENERAL", items: [] });
     }
-    draft.sections[sectionIndex].items.push({ text: "", children: [], footers: [] });
+    draft.sections[sectionIndex].items.push({ uiId: createUiId("item"), text: "", children: [], footers: [], childUiIds: [], footerUiIds: [] });
   }, true);
 
   const toggleSection = (sectionIndex: number, element: HTMLElement | null) => {
@@ -1387,14 +2455,26 @@ const StructuredEditor = React.memo(function StructuredEditor({
           label="Add Bullet To"
           value={String(clampedActiveSectionIndex)}
           options={sectionOptions}
-          onChange={(value) => setActiveSectionIndex(Number(value))}
+          onChange={(value) => {
+            activeSectionIndexRef.current = Number(value);
+            setActiveSectionIndex(Number(value));
+          }}
         />
         <button className="primary addBulletButton" onClick={() => addBulletToSection()}>
           <Plus size={16} /> Add Bullet
         </button>
       </div>
       {localLog.sections.map((section, sectionIndex) => (
-        <section key={`section-${sectionIndex}`} data-section-index={sectionIndex} className={collapsedSectionsRef.current.has(sectionIndex) ? "sectionEditor collapsed" : "sectionEditor"} onClick={() => setActiveSectionIndex(sectionIndex)}>
+        <section
+          key={section.uiId}
+          data-section-index={sectionIndex}
+          data-section-ui-id={section.uiId}
+          className={collapsedSectionsRef.current.has(sectionIndex) ? "sectionEditor collapsed" : "sectionEditor"}
+          onClick={() => {
+            activeSectionIndexRef.current = sectionIndex;
+            setActiveSectionIndex(sectionIndex);
+          }}
+        >
           <div className="sectionSummary">
             <div className="sectionHeading">
               <button className="collapseToggle" title="Expand or collapse section" onClick={(event) => { event.stopPropagation(); toggleSection(sectionIndex, event.currentTarget.closest(".sectionEditor")); }}>
@@ -1404,8 +2484,14 @@ const StructuredEditor = React.memo(function StructuredEditor({
               <span className="itemCount">{section.items.length} bullet{section.items.length === 1 ? "" : "s"}</span>
             </div>
             <div className="sectionActions">
-              <button className="iconButton moveButton" title="Move section down" onClick={() => moveSection(sectionIndex, 1)}><ArrowDown size={15} /></button>
-              <button className="iconButton moveButton" title="Move section up" onClick={() => moveSection(sectionIndex, -1)}><ArrowUp size={15} /></button>
+              <button
+                className="iconButton dragHandle sectionDragHandle"
+                title="Drag section to reorder"
+                aria-label={`Drag ${section.title || `section ${sectionIndex + 1}`}`}
+                onPointerDown={(event) => beginSectionDrag(event, { sectionIndex, sectionUiId: section.uiId })}
+              >
+                <GripVertical size={16} />
+              </button>
               <button className="iconButton dangerButton" title="Delete section" onClick={() => setLog((draft) => { draft.sections.splice(sectionIndex, 1); }, true)}><X size={14} /></button>
             </div>
           </div>
@@ -1414,15 +2500,18 @@ const StructuredEditor = React.memo(function StructuredEditor({
               {section.items.map((item, itemIndex) => (
                 <div
                   className="itemEditor"
-                  key={`item-${sectionIndex}-${itemIndex}`}
+                  key={item.uiId}
                   data-section-index={sectionIndex}
+                  data-section-ui-id={section.uiId}
                   data-item-index={itemIndex}
+                  data-item-ui-id={item.uiId}
                 >
                   <div className="itemLine">
                     <button
                       className="iconButton dragHandle"
                       title="Drag bullet to reorder"
-                      onPointerDown={(event) => beginBulletDrag(event, { sectionIndex, itemIndex })}
+                      aria-label={`Drag bullet ${itemIndex + 1}`}
+                      onPointerDown={(event) => beginBulletDrag(event, { sectionIndex, sectionUiId: section.uiId, itemIndex, itemUiId: item.uiId })}
                     >
                       <GripVertical size={16} />
                     </button>
@@ -1444,14 +2533,14 @@ const StructuredEditor = React.memo(function StructuredEditor({
                     </div>
                   </div>
                   {item.children.map((child, childIndex) => (
-                    <div className="childLine" key={`child-${sectionIndex}-${itemIndex}-${childIndex}`}>
+                    <div className="childLine" key={item.childUiIds[childIndex] ?? `${item.uiId}-child-${childIndex}`}>
                       <span className="nestedMarker">{"\u25e6"}</span>
                       <MarkdownTextInput value={child} onChange={(value) => updateChildText(sectionIndex, itemIndex, childIndex, value)} />
                       <button className="iconButton dangerButton" title="Delete nested bullet" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].children.splice(childIndex, 1); }, true)}><X size={14} /></button>
                     </div>
                   ))}
                   {(item.footers ?? []).map((footer, footerIndex) => (
-                    <div className="footerLine" key={`footer-${sectionIndex}-${itemIndex}-${footerIndex}`}>
+                    <div className="footerLine" key={item.footerUiIds[footerIndex] ?? `${item.uiId}-footer-${footerIndex}`}>
                       <span className="footerMarker">-#</span>
                       <MarkdownTextInput value={footer} placeholder="Subtext / footer under this bullet" onChange={(value) => updateItemFooter(sectionIndex, itemIndex, footerIndex, value)} />
                       <button className="iconButton dangerButton" title="Delete subtext footer" onClick={() => setLog((draft) => { draft.sections[sectionIndex].items[itemIndex].footers?.splice(footerIndex, 1); }, true)}><X size={14} /></button>
@@ -1482,7 +2571,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
           <Plus size={16} /> Add Bullet
         </button>
       </div>
-      <button className="primary" onClick={() => setLog((draft) => { draft.sections.push({ title: "NEW SECTION", items: [] }); }, true)}>
+      <button className="primary" onClick={() => setLog((draft) => { draft.sections.push({ uiId: createUiId("section"), title: "NEW SECTION", items: [] }); }, true)}>
         <Plus size={16} /> Section
       </button>
       <label className="settingToggle footerToggle">
@@ -1514,7 +2603,7 @@ const Preview = React.memo(function Preview({
   emojiMap
 }: {
   rawMarkdown: string;
-  splitResult: ReturnType<typeof splitDiscordMessages>;
+  splitResult: SplitResult;
   emojiMap: Map<string, string>;
 }) {
   const [mode, setMode] = useState<"desktop" | "mobile" | "raw">("desktop");
@@ -1587,38 +2676,38 @@ const DiscordMarkdown = React.memo(function DiscordMarkdown({ raw, emojiMap }: {
         return;
       }
       if (line.trim() === "") {
-        nextNodes.push(<div className="blankLine" key={index} />);
+        nextNodes.push(<div className="blankLine" key={`blank-${index}`} />);
         return;
       }
       if (line.startsWith("## ") && !line.startsWith("### ")) {
-        nextNodes.push(<h2 key={index}>{renderInline(line.slice(3), emojiMap)}</h2>);
+        nextNodes.push(<h2 key={`h2-${index}`}>{renderInline(line.slice(3), emojiMap, `line-${index}`)}</h2>);
         return;
       }
       if (line.startsWith("### ")) {
-        nextNodes.push(<h3 key={index}>{renderInline(line.slice(4), emojiMap)}</h3>);
+        nextNodes.push(<h3 key={`h3-${index}`}>{renderInline(line.slice(4), emojiMap, `line-${index}`)}</h3>);
         return;
       }
       if (line.startsWith("-# ")) {
-        nextNodes.push(<p className="subtext" key={index}>{renderInline(line.slice(3), emojiMap)}</p>);
+        nextNodes.push(<p className="subtext" key={`subtext-${index}`}>{renderInline(line.slice(3), emojiMap, `line-${index}`)}</p>);
         return;
       }
       if (line.startsWith("  -# ")) {
-        nextNodes.push(<p className="subtext nestedSubtext" key={index}>{renderInline(line.slice(5), emojiMap)}</p>);
+        nextNodes.push(<p className="subtext nestedSubtext" key={`nested-subtext-${index}`}>{renderInline(line.slice(5), emojiMap, `line-${index}`)}</p>);
         return;
       }
       if (line.startsWith("> ")) {
-        nextNodes.push(<blockquote key={index}>{renderInline(line.slice(2), emojiMap)}</blockquote>);
+        nextNodes.push(<blockquote key={`quote-${index}`}>{renderInline(line.slice(2), emojiMap, `line-${index}`)}</blockquote>);
         return;
       }
       if (line.startsWith("  - ")) {
-        nextNodes.push(<div className="previewBullet nested" key={index}><span>{"\u25e6"}</span><p>{renderInline(line.slice(4), emojiMap)}</p></div>);
+        nextNodes.push(<div className="previewBullet nested" key={`nested-bullet-${index}`}><span>{"\u25e6"}</span><p>{renderInline(line.slice(4), emojiMap, `line-${index}`)}</p></div>);
         return;
       }
       if (line.startsWith("- ")) {
-        nextNodes.push(<div className="previewBullet" key={index}><span>{"\u2022"}</span><p>{renderInline(line.slice(2), emojiMap)}</p></div>);
+        nextNodes.push(<div className="previewBullet" key={`bullet-${index}`}><span>{"\u2022"}</span><p>{renderInline(line.slice(2), emojiMap, `line-${index}`)}</p></div>);
         return;
       }
-      nextNodes.push(<p key={index}>{renderInline(line, emojiMap)}</p>);
+      nextNodes.push(<p key={`p-${index}`}>{renderInline(line, emojiMap, `line-${index}`)}</p>);
     });
     flushCode(lines.length + 1);
     return nextNodes;
@@ -1627,28 +2716,28 @@ const DiscordMarkdown = React.memo(function DiscordMarkdown({ raw, emojiMap }: {
   return <>{nodes}</>;
 });
 
-function renderInline(text: string, emojiMap: Map<string, string>): React.ReactNode[] {
+function renderInline(text: string, emojiMap: Map<string, string>, keyPrefix = "inline"): React.ReactNode[] {
   const pattern = /(`[^`]+`|\|\|[^|]+\|\||\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|\*[^*]+\*|\[[^\]]+\]\([^)]+\))/g;
   const parts: React.ReactNode[] = [];
   let lastIndex = 0;
   for (const match of text.matchAll(pattern)) {
     if (match.index === undefined) continue;
-    if (match.index > lastIndex) parts.push(...renderPlainTextWithEmojis(text.slice(lastIndex, match.index), emojiMap));
+    if (match.index > lastIndex) parts.push(...renderPlainTextWithEmojis(text.slice(lastIndex, match.index), emojiMap, `${keyPrefix}-plain-${lastIndex}`));
     const token = match[0];
-    const key = `${match.index}-${token}`;
+    const key = `${keyPrefix}-${match.index}-${token}`;
     if (token.startsWith("`")) parts.push(<code key={key}>{token.slice(1, -1)}</code>);
-    else if (token.startsWith("||")) parts.push(<span className="spoiler" key={key}>{renderInline(token.slice(2, -2), emojiMap)}</span>);
-    else if (token.startsWith("**")) parts.push(<strong key={key}>{renderInline(token.slice(2, -2), emojiMap)}</strong>);
-    else if (token.startsWith("__")) parts.push(<u key={key}>{renderInline(token.slice(2, -2), emojiMap)}</u>);
-    else if (token.startsWith("~~")) parts.push(<s key={key}>{renderInline(token.slice(2, -2), emojiMap)}</s>);
-    else if (token.startsWith("*")) parts.push(<em key={key}>{renderInline(token.slice(1, -1), emojiMap)}</em>);
+    else if (token.startsWith("||")) parts.push(<span className="spoiler" key={key}>{renderInline(token.slice(2, -2), emojiMap, `${key}-spoiler`)}</span>);
+    else if (token.startsWith("**")) parts.push(<strong key={key}>{renderInline(token.slice(2, -2), emojiMap, `${key}-strong`)}</strong>);
+    else if (token.startsWith("__")) parts.push(<u key={key}>{renderInline(token.slice(2, -2), emojiMap, `${key}-underline`)}</u>);
+    else if (token.startsWith("~~")) parts.push(<s key={key}>{renderInline(token.slice(2, -2), emojiMap, `${key}-strike`)}</s>);
+    else if (token.startsWith("*")) parts.push(<em key={key}>{renderInline(token.slice(1, -1), emojiMap, `${key}-em`)}</em>);
     else {
       const link = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-      parts.push(link ? <a key={key} href={link[2]} target="_blank" rel="noreferrer">{renderInline(link[1], emojiMap)}</a> : token);
+      parts.push(link ? <a key={key} href={link[2]} target="_blank" rel="noreferrer">{renderInline(link[1], emojiMap, `${key}-link`)}</a> : token);
     }
     lastIndex = match.index + token.length;
   }
-  if (lastIndex < text.length) parts.push(...renderPlainTextWithEmojis(text.slice(lastIndex), emojiMap));
+  if (lastIndex < text.length) parts.push(...renderPlainTextWithEmojis(text.slice(lastIndex), emojiMap, `${keyPrefix}-plain-${lastIndex}`));
   return parts;
 }
 
@@ -1824,7 +2913,7 @@ const SplitPanel = React.memo(function SplitPanel({
   settings,
   onTogglePartHeaders
 }: {
-  result: ReturnType<typeof splitDiscordMessages>;
+  result: SplitResult;
   onCopy: (text: string, label: string) => void;
   rawMarkdown: string;
   settings?: AppSettings;
@@ -1914,7 +3003,7 @@ function AiPanel({
   const [modelMode, setModelMode] = useState("default");
   const [customModel, setCustomModel] = useState("");
   const [proposal, setProposal] = useState<(AiEditResponse & { updatedMarkdown: string }) | null>(null);
-  const codexStatus = useQuery({ queryKey: ["codex-status"], queryFn: () => api<any>("/api/codex/status"), ...codexStatusQueryOptions });
+  const codexStatus = useQuery({ queryKey: ["codex-status", "fast"], queryFn: () => api<any>("/api/codex/status?full=false"), ...codexStatusQueryOptions });
   const codexDefaultModel = codexStatus.data?.defaultModel || "CLI configured model";
   const modelOptions: SelectOption[] = [
     { value: "default", label: "Use Codex default", meta: `Uses ${displayModelName(codexDefaultModel)}` },
@@ -2008,12 +3097,81 @@ function AiPanel({
   );
 }
 
-function HistoryPanel({ draftId }: { draftId: string }) {
+function HistoryPanel({
+  draftId,
+  settings,
+  emojiMap,
+  onCopy,
+  onRestored
+}: {
+  draftId: string;
+  settings?: AppSettings;
+  emojiMap: Map<string, string>;
+  onCopy: (text: string, label: string) => Promise<void>;
+  onRestored: (draft: DraftRecord) => void;
+}) {
   const queryClient = useQueryClient();
+  const [confirmRestoreVersionId, setConfirmRestoreVersionId] = useState<string | null>(null);
+  const [previewVersionId, setPreviewVersionId] = useState<string | null>(null);
   const versions = useQuery({ queryKey: ["versions", draftId], queryFn: () => api<VersionsResponse>(`/api/drafts/${draftId}/versions`) });
+  const backups = useQuery({ queryKey: ["draft-backups", draftId], queryFn: () => api<DraftBackupsResponse>(`/api/drafts/${draftId}/backups`) });
+  const previewVersion = useQuery({
+    queryKey: ["version", previewVersionId],
+    queryFn: () => {
+      if (!previewVersionId) throw new Error("No version selected.");
+      return api<VersionResponse>(`/api/versions/${previewVersionId}`);
+    },
+    enabled: !!previewVersionId
+  });
+  const versionToPreview = previewVersion.data?.version;
+  const restoreCandidate = versions.data?.versions.find((version) => version.id === confirmRestoreVersionId);
+  const previewSplitResult = useMemo(() => {
+    if (!versionToPreview) return emptySplitResult;
+    return splitDiscordMessages(versionToPreview.rawMarkdown, {
+      mode: settings?.characterLimitMode ?? "normal",
+      customLimit: settings?.customLimit,
+      continuationHeaders: settings?.continuationHeaders,
+      title: versionToPreview.structured.title,
+      footer: versionToPreview.structured.footer
+    });
+  }, [
+    settings?.characterLimitMode,
+    settings?.continuationHeaders,
+    settings?.customLimit,
+    versionToPreview
+  ]);
   const restore = useMutation({
     mutationFn: (id: string) => api<DraftResponse>(`/api/versions/${id}/restore`, { method: "POST" }),
-    onSuccess: () => queryClient.invalidateQueries()
+    onSuccess: (data) => {
+      const summary = draftSummaryFromRecord(data.draft);
+      setConfirmRestoreVersionId(null);
+      setPreviewVersionId(null);
+      queryClient.setQueryData<DraftResponse>(["draft", data.draft.id], data);
+      queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
+        if (!previous) return { drafts: [summary] };
+        const nextDrafts = previous.drafts.map((draft) => (draft.id === summary.id ? summary : draft));
+        if (!nextDrafts.some((draft) => draft.id === summary.id)) nextDrafts.unshift(summary);
+        return { drafts: nextDrafts };
+      });
+      onRestored(data.draft);
+      queryClient.invalidateQueries({ queryKey: ["versions", data.draft.id] });
+    }
+  });
+  const restoreBackup = useMutation({
+    mutationFn: () => api<DraftResponse>(`/api/drafts/${draftId}/backups/restore-latest`, { method: "POST" }),
+    onSuccess: (data) => {
+      const summary = draftSummaryFromRecord(data.draft);
+      queryClient.setQueryData<DraftResponse>(["draft", data.draft.id], data);
+      queryClient.setQueryData<DraftsResponse>(["drafts"], (previous) => {
+        if (!previous) return { drafts: [summary] };
+        const nextDrafts = previous.drafts.map((draft) => (draft.id === summary.id ? summary : draft));
+        if (!nextDrafts.some((draft) => draft.id === summary.id)) nextDrafts.unshift(summary);
+        return { drafts: nextDrafts };
+      });
+      onRestored(data.draft);
+      queryClient.invalidateQueries({ queryKey: ["versions", data.draft.id] });
+      queryClient.invalidateQueries({ queryKey: ["draft-backups", data.draft.id] });
+    }
   });
   return (
     <div className="historyPanel">
@@ -2023,13 +3181,86 @@ function HistoryPanel({ draftId }: { draftId: string }) {
           <span>Saved draft snapshots</span>
         </div>
       </div>
+      <article className="backupRecovery">
+        <div>
+          <strong>File Recovery</strong>
+          <span>{backups.data ? `${backups.data.backups.length.toLocaleString()} backup snapshots plus latest.md` : "Loading local backup mirror..."}</span>
+        </div>
+        <div className="historyActions">
+          <button disabled={!backups.data?.latestBackupPath} onClick={() => backups.data && onCopy(backups.data.latestBackupPath, "Latest backup path copied")}>
+            <Copy size={15} /> Latest
+          </button>
+          <button disabled={!backups.data?.backupDir} onClick={() => backups.data && onCopy(backups.data.backupDir, "Backup folder copied")}>
+            <FileText size={15} /> Folder
+          </button>
+          <button disabled={restoreBackup.isPending || !backups.data?.latestBackupPath} onClick={() => restoreBackup.mutate()}>
+            <History size={15} /> {restoreBackup.isPending ? "Restoring..." : "Restore Latest"}
+          </button>
+        </div>
+      </article>
+      {backups.error && <div className="warning">{backups.error.message}</div>}
+      {restoreBackup.error && <div className="warning">{restoreBackup.error.message}</div>}
+      {versions.isPending && <div className="emptyState">Loading saved versions...</div>}
+      {versions.error && <div className="warning">{versions.error.message}</div>}
+      {versions.data?.versions.length === 0 && <div className="emptyState">No saved versions yet.</div>}
       {versions.data?.versions.map((version) => (
         <article className="historyItem" key={version.id}>
-          <strong>{version.label}</strong>
-          <span>{new Date(version.createdAt).toLocaleString()}</span>
-          <button onClick={() => restore.mutate(version.id)}>Restore</button>
+          <div>
+            <strong>{version.label}</strong>
+            <span>{new Date(version.createdAt).toLocaleString()}</span>
+          </div>
+          <span>{version.rawLength.toLocaleString()} chars</span>
+          <div className="historyActions">
+            <button disabled={previewVersionId === version.id && previewVersion.isFetching} onClick={() => setPreviewVersionId(version.id)}>
+              <Eye size={15} /> {previewVersionId === version.id && previewVersion.isFetching ? "Loading..." : "Preview"}
+            </button>
+            <button onClick={() => setConfirmRestoreVersionId(version.id)}>
+              <History size={15} /> Restore
+            </button>
+          </div>
         </article>
       ))}
+      {previewVersionId && (
+        <div className="modalBackdrop" role="dialog" aria-modal="true">
+          <div className="confirmModal historyPreviewModal">
+            <div className="historyPreviewHeader">
+              <div>
+                <h3>{versionToPreview ? `Preview ${versionToPreview.label}` : "Preview Version"}</h3>
+                <p>{versionToPreview ? `${new Date(versionToPreview.createdAt).toLocaleString()} - ${versionToPreview.rawMarkdown.length.toLocaleString()} chars` : "Loading saved snapshot..."}</p>
+              </div>
+              <button className="iconButton" title="Close preview" onClick={() => setPreviewVersionId(null)}><X size={16} /></button>
+            </div>
+            {previewVersion.error && <div className="warning">{previewVersion.error.message}</div>}
+            {versionToPreview ? (
+              <div className="historyPreviewBody">
+                <Preview rawMarkdown={versionToPreview.rawMarkdown} splitResult={previewSplitResult} emojiMap={emojiMap} />
+              </div>
+            ) : (
+              <div className="emptyState">Loading preview...</div>
+            )}
+            <div className="modalActions">
+              <button onClick={() => setPreviewVersionId(null)}>Close</button>
+              <button className="primary" disabled={!versionToPreview} onClick={() => versionToPreview && setConfirmRestoreVersionId(versionToPreview.id)}>
+                <History size={16} /> Restore This Version
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {restoreCandidate && (
+        <div className="modalBackdrop" role="dialog" aria-modal="true">
+          <div className="confirmModal">
+            <h3>Restore Version?</h3>
+            <p>This replaces the current draft with <strong>{restoreCandidate.label}</strong> from {new Date(restoreCandidate.createdAt).toLocaleString()}.</p>
+            <div className="modalActions">
+              <button onClick={() => setConfirmRestoreVersionId(null)}>Cancel</button>
+              <button className="primary" disabled={restore.isPending} onClick={() => restore.mutate(restoreCandidate.id)}>
+                <History size={16} /> {restore.isPending ? "Restoring..." : "Restore Version"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2039,7 +3270,7 @@ function SettingsPanel({ settings }: { settings: AppSettings }) {
   const [statusActionText, setStatusActionText] = useState("");
   const hasLoadedSettings = useRef(false);
   const queryClient = useQueryClient();
-  const status = useQuery({ queryKey: ["codex-status"], queryFn: () => api<any>("/api/codex/status"), ...codexStatusQueryOptions });
+  const status = useQuery({ queryKey: ["codex-status", "fast"], queryFn: () => api<any>("/api/codex/status?full=false"), ...codexStatusQueryOptions });
   const codexDefaultModel = status.data?.defaultModel || "CLI configured model";
   const modelOptions: SelectOption[] = [
     { value: "gpt-5.4", label: "GPT-5.4", meta: "Recommended for this CLI" },
@@ -2061,11 +3292,17 @@ function SettingsPanel({ settings }: { settings: AppSettings }) {
       queryClient.invalidateQueries({ queryKey: ["codex-status"] });
     }
   });
+  const refreshStatus = useMutation({
+    mutationFn: () => api<any>("/api/codex/status?full=true&force=true"),
+    onSuccess: (data) => {
+      queryClient.setQueryData(["codex-status", "fast"], data);
+    }
+  });
   const updateCodex = useMutation({
     mutationFn: () => api<{ ok: boolean; output: string }>("/api/codex/update", { method: "POST" }),
-    onSuccess: () => status.refetch()
+    onSuccess: () => refreshStatus.mutate()
   });
-  const statusRefreshing = status.isLoading || status.isFetching;
+  const statusRefreshing = status.isLoading || status.isFetching || refreshStatus.isPending;
   const statusPending = status.isLoading || (status.isFetching && !status.data);
   const needsCodexUpdate = typeof status.data?.smokeTestError === "string" && status.data.smokeTestError.includes("requires a newer version of Codex");
   const codexReady = !!status.data?.installed && !!status.data?.loggedIn && !!status.data?.smokeTest;
@@ -2117,12 +3354,12 @@ function SettingsPanel({ settings }: { settings: AppSettings }) {
         pending={statusPending}
         label="Exec ready"
         ok={!!status.data?.smokeTest}
-        detail={status.data?.smokeTestError || "read-only JSON exec"}
+        detail={status.data?.smokeTestError || (status.data?.cache?.full ? "read-only JSON exec" : "Run refresh for smoke test")}
         actionLabel="Refresh"
-        onAction={() => status.refetch()}
+        onAction={() => refreshStatus.mutate()}
       />
       <div className="settingsActions">
-        <button className={statusRefreshing ? "refreshButton loading" : "refreshButton"} disabled={statusRefreshing} onClick={() => status.refetch()}>
+        <button className={statusRefreshing ? "refreshButton loading" : "refreshButton"} disabled={statusRefreshing} onClick={() => refreshStatus.mutate()}>
           <RefreshCw size={15} /> {statusRefreshing ? "Refreshing..." : "Refresh status"}
         </button>
         {statusPending ? (
@@ -2144,6 +3381,7 @@ function SettingsPanel({ settings }: { settings: AppSettings }) {
         )}
       </div>
       {statusActionText && <div className="settingsSaveHint">{statusActionText}</div>}
+      {refreshStatus.error && <div className="warning">{refreshStatus.error.message}</div>}
       {updateCodex.error && <div className="warning">{updateCodex.error.message}</div>}
       {updateCodex.data?.ok && <div className="success">Codex CLI update finished.</div>}
       <h3>Defaults</h3>
@@ -2174,6 +3412,9 @@ function SettingsPanel({ settings }: { settings: AppSettings }) {
         </span>
       </label>
       <label>Autosave ms<input type="number" value={local.autosaveIntervalMs} onChange={(event) => setLocal({ ...local, autosaveIntervalMs: Number(event.target.value) })} /></label>
+      <label>History autosave ms<input type="number" value={local.autosaveHistoryIntervalMs} onChange={(event) => setLocal({ ...local, autosaveHistoryIntervalMs: Number(event.target.value) })} /></label>
+      <label>Auto history limit<input type="number" value={local.autosaveHistoryLimit} onChange={(event) => setLocal({ ...local, autosaveHistoryLimit: Number(event.target.value) })} /></label>
+      <label>Auto history cap<input type="number" value={Math.round(local.autosaveHistoryMaxBytes / 100000) / 10} step="0.1" onChange={(event) => setLocal({ ...local, autosaveHistoryMaxBytes: Math.round(Number(event.target.value) * 1000 * 1000) })} /><small>{formatSize(local.autosaveHistoryMaxBytes)}</small></label>
       <button className="primary" onClick={() => save.mutate()}><Save size={15} /> {save.isPending ? "Saving..." : "Save settings"}</button>
       <div className="settingsSaveHint">{save.isPending ? "Auto-saving settings..." : "Settings auto-save after changes."}</div>
     </div>

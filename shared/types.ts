@@ -88,6 +88,9 @@ export const settingsSchema = z.object({
   defaultFooter: z.string().default("-# ||@everyone||"),
   theme: z.enum(["dark", "midnight"]).default("dark"),
   autosaveIntervalMs: z.number().int().min(1000).max(60000).default(2500),
+  autosaveHistoryIntervalMs: z.number().int().min(30000).max(3600000).default(120000),
+  autosaveHistoryLimit: z.number().int().min(3).max(100).default(25),
+  autosaveHistoryMaxBytes: z.number().int().min(100000).max(50000000).default(2000000),
   continuationHeaders: z.boolean().default(false),
   customEmojis: z.array(customEmojiSchema).default([])
 });
@@ -105,8 +108,18 @@ export type DraftRecord = {
   rawMarkdown: string;
   structured: UpdateLog;
   filePath: string;
+  backupPath?: string;
   createdAt: string;
   updatedAt: string;
+};
+
+export type DraftSummary = {
+  id: string;
+  name: string;
+  filePath: string;
+  createdAt: string;
+  updatedAt: string;
+  rawLength: number;
 };
 
 export type VersionRecord = {
@@ -116,6 +129,37 @@ export type VersionRecord = {
   structured: UpdateLog;
   label: string;
   createdAt: string;
+};
+
+export type VersionSummary = {
+  id: string;
+  draftId: string;
+  label: string;
+  createdAt: string;
+  rawLength: number;
+};
+
+export type DraftBackupSummary = {
+  fileName: string;
+  filePath: string;
+  createdAt: string;
+  rawLength: number;
+  reason: string;
+};
+
+export type DraftRetrievalSource = "current" | "version";
+
+export type DraftRetrievalMatch = {
+  source: DraftRetrievalSource;
+  id: string;
+  draftId: string;
+  draftName: string;
+  label?: string;
+  matchedAt: string;
+  rawMarkdown: string;
+  structured: UpdateLog;
+  rawLength: number;
+  filePath?: string;
 };
 
 export type CodexIntakeEntry = {

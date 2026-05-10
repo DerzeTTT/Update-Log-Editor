@@ -1,4 +1,4 @@
-import express from "express";
+import express, { type NextFunction, type Request, type Response } from "express";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -6,21 +6,28 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import {
   appendCodexIntake,
+  createAutosaveVersion,
   createDraft,
   createVersion,
   deleteDraft,
   duplicateDraft,
   getDraft,
+  getDraftBackupDir,
+  getDraftLatestBackupPath,
   getDraftMarkdownPath,
+  getVersion,
   getSettings,
   importDraftMarkdownFile,
   initDb,
   listAiHistory,
   listCodexIntakeForDay,
-  listDrafts,
-  listVersions,
+  listDraftBackups,
+  listDraftSummaries,
+  listVersionSummaries,
   recordAiHistory,
+  retrieveDrafts,
   restoreVersion,
+  restoreLatestDraftBackup,
   saveSettings,
   updateDraft
 } from "./db";
@@ -51,7 +58,7 @@ app.get("/api/health", (_req, res) => {
 });
 
 app.get("/api/drafts", (_req, res) => {
-  res.json({ drafts: listDrafts() });
+  res.json({ drafts: listDraftSummaries() });
 });
 
 app.post("/api/drafts", (req, res) => {
@@ -92,11 +99,26 @@ app.put("/api/drafts/:id", (req, res) => {
   res.json({ draft });
 });
 
+app.post("/api/drafts/:id/emergency-save", (req, res) => {
+  const existing = getDraft(req.params.id);
+  if (!existing) return res.status(404).json({ error: "Draft not found." });
+  const body = z.object({
+    name: z.string().min(1).optional(),
+    rawMarkdown: z.string(),
+    structured: updateLogSchema.optional()
+  }).parse(req.body);
+  const structured = body.structured ?? parseUpdateLog(body.rawMarkdown).log;
+  const draft = updateDraft(existing.id, body.rawMarkdown, structured, body.name) ?? existing;
+  const version = createAutosaveVersion(draft, getSettings());
+  res.json({ version: version ?? null, draft });
+});
+
 app.post("/api/drafts/:id/save-version", (req, res) => {
   const existing = getDraft(req.params.id);
   if (!existing) return res.status(404).json({ error: "Draft not found." });
   const body = z.object({
     label: z.string().default("Manual save"),
+    autosave: z.boolean().default(false),
     name: z.string().min(1).optional(),
     rawMarkdown: z.string().optional(),
     structured: updateLogSchema.optional()
@@ -104,8 +126,26 @@ app.post("/api/drafts/:id/save-version", (req, res) => {
   const rawMarkdown = body.rawMarkdown ?? existing.rawMarkdown;
   const structured = body.structured ?? parseUpdateLog(rawMarkdown).log;
   const draft = updateDraft(existing.id, rawMarkdown, structured, body.name) ?? existing;
-  const version = createVersion(draft.id, draft.rawMarkdown, draft.structured, body.label);
-  res.status(201).json({ version, draft });
+  const version = body.autosave
+    ? createAutosaveVersion(draft, getSettings())
+    : createVersion(draft.id, draft.rawMarkdown, draft.structured, body.label);
+  res.status(version ? 201 : 200).json({ version: version ?? null, draft });
+});
+
+app.get("/api/drafts/:id/backups", (req, res) => {
+  const draft = getDraft(req.params.id);
+  if (!draft) return res.status(404).json({ error: "Draft not found." });
+  res.json({
+    backupDir: getDraftBackupDir(draft.id),
+    latestBackupPath: getDraftLatestBackupPath(draft.id),
+    backups: listDraftBackups(draft.id)
+  });
+});
+
+app.post("/api/drafts/:id/backups/restore-latest", (req, res) => {
+  const draft = restoreLatestDraftBackup(req.params.id);
+  if (!draft) return res.status(404).json({ error: "Backup not found." });
+  res.json({ draft });
 });
 
 app.post("/api/drafts/:id/duplicate", (req, res) => {
@@ -120,7 +160,13 @@ app.delete("/api/drafts/:id", (req, res) => {
 });
 
 app.get("/api/drafts/:id/versions", (req, res) => {
-  res.json({ versions: listVersions(req.params.id) });
+  res.json({ versions: listVersionSummaries(req.params.id) });
+});
+
+app.get("/api/versions/:id", (req, res) => {
+  const version = getVersion(req.params.id);
+  if (!version) return res.status(404).json({ error: "Version not found." });
+  res.json({ version });
 });
 
 app.post("/api/versions/:id/restore", (req, res) => {
@@ -198,10 +244,45 @@ app.post("/api/emojis/upload", (req, res) => {
   }
 });
 
-app.get("/api/codex/status", async (_req, res) => {
+app.get("/api/codex/status", async (req, res) => {
   const settings = getSettings();
   const selected = settings.selectedModelMode === "custom" ? settings.customModel : settings.selectedModelMode;
-  res.json(await getCodexStatus(selected));
+  const query = z.object({
+    full: z.coerce.boolean().default(false),
+    force: z.coerce.boolean().default(false)
+  }).parse(req.query);
+  res.json(await getCodexStatus(selected, query));
+});
+
+app.get("/api/codex/drafts/retrieve", (req, res) => {
+  const query = z.object({
+    when: z.string().trim().optional(),
+    q: z.string().trim().optional(),
+    query: z.string().trim().optional(),
+    draftId: z.string().trim().optional(),
+    source: z.enum(["all", "current", "versions"]).default("all"),
+    limit: z.coerce.number().int().min(1).max(50).default(10)
+  }).parse(req.query);
+  const result = retrieveDrafts({
+    when: query.when,
+    query: query.query ?? query.q,
+    draftId: query.draftId,
+    source: query.source,
+    limit: query.limit
+  });
+  res.json({
+    ...result,
+    count: result.matches.length
+  });
+});
+
+app.post("/api/codex/drafts/restore", (req, res) => {
+  const body = z.object({
+    versionId: z.string().min(1)
+  }).parse(req.body);
+  const draft = restoreVersion(body.versionId);
+  if (!draft) return res.status(404).json({ error: "Version not found." });
+  res.json({ draft });
 });
 
 app.post("/api/codex/update", async (_req, res) => {
@@ -290,6 +371,19 @@ app.post("/api/import", (req, res) => {
   const raw = body.rawMarkdown ?? serializeUpdateLog(body.structured!);
   const draft = createDraft(body.name, raw, body.structured);
   res.status(201).json({ draft });
+});
+
+app.use((error: unknown, _req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    next(error);
+    return;
+  }
+  const isValidationError = error instanceof z.ZodError;
+  const isEmptyOverwriteError = error instanceof Error && error.message.startsWith("Refusing to replace a non-empty draft");
+  const message = isValidationError
+    ? error.issues.map((issue) => `${issue.path.join(".") || "body"}: ${issue.message}`).join("; ")
+    : error instanceof Error ? error.message : "Unexpected server error.";
+  res.status(isValidationError ? 400 : isEmptyOverwriteError ? 409 : 500).json({ error: message.slice(0, 4000) });
 });
 
 app.listen(port, "127.0.0.1", () => {

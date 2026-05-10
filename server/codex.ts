@@ -17,6 +17,17 @@ type CommandResult = {
   stderr: string;
 };
 
+type CodexStatusOptions = {
+  full?: boolean;
+  force?: boolean;
+};
+
+type CodexStatus = Awaited<ReturnType<typeof buildCodexStatus>>;
+
+const statusCache = new Map<string, { status: CodexStatus; expiresAtMs: number }>();
+const fastStatusTtlMs = 60_000;
+const fullStatusTtlMs = 300_000;
+
 function runCommand(command: string, args: string[], input?: string, timeoutMs = 120000): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
     const resolved = resolveCommand(command, args);
@@ -94,7 +105,33 @@ export function validateModelName(model: string): boolean {
   return /^[a-zA-Z0-9._:-]{1,80}$/.test(model);
 }
 
-export async function getCodexStatus(selectedModel: string) {
+function cloneStatus(status: CodexStatus, cached: boolean): CodexStatus {
+  return {
+    ...status,
+    cache: {
+      ...status.cache,
+      cached
+    }
+  };
+}
+
+export async function getCodexStatus(selectedModel: string, options: CodexStatusOptions = {}) {
+  const full = !!options.full;
+  const cacheKey = `${full ? "full" : "fast"}:${selectedModel || "default"}`;
+  const cached = statusCache.get(cacheKey);
+  if (!options.force && cached && cached.expiresAtMs > Date.now()) {
+    return cloneStatus(cached.status, true);
+  }
+
+  const status = await buildCodexStatus(selectedModel, full);
+  const ttl = full ? fullStatusTtlMs : fastStatusTtlMs;
+  status.cache.expiresAt = new Date(Date.now() + ttl).toISOString();
+  statusCache.set(cacheKey, { status, expiresAtMs: Date.now() + ttl });
+  return cloneStatus(status, false);
+}
+
+async function buildCodexStatus(selectedModel: string, full: boolean) {
+  const checkedAt = new Date().toISOString();
   const status = {
     installed: false,
     version: "",
@@ -113,7 +150,13 @@ export async function getCodexStatus(selectedModel: string) {
     defaultModel: getCodexDefaultModel(),
     installCommand: "npm i -g @openai/codex",
     loginCommand: "codex login",
-    error: ""
+    error: "",
+    cache: {
+      cached: false,
+      full,
+      checkedAt,
+      expiresAt: checkedAt
+    }
   };
 
   try {
@@ -145,7 +188,7 @@ export async function getCodexStatus(selectedModel: string) {
     status.supports.approvalNever = false;
   }
 
-  if (status.installed && status.loggedIn && status.supports.readOnlySandbox && status.supports.json) {
+  if (full && status.installed && status.loggedIn && status.supports.readOnlySandbox && status.supports.json) {
     try {
       const smokeArgs = ["-a", "never", "exec", "--sandbox", "read-only", "--json"];
       if (selectedModel && selectedModel !== "default" && validateModelName(selectedModel)) {
@@ -188,6 +231,7 @@ export async function updateCodexCli() {
   if (result.code !== 0) {
     throw new Error(sanitize(result.stderr || result.stdout || `npm exited with code ${result.code}.`));
   }
+  statusCache.clear();
   return {
     ok: true,
     output: sanitize(`${result.stdout}\n${result.stderr}`).slice(-4000)
