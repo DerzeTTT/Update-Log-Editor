@@ -717,9 +717,6 @@ textarea { resize: vertical; }
   padding: 7px 10px;
 }
 .stickyAddBar {
-  position: sticky;
-  top: 0;
-  z-index: 6;
   display: grid;
   grid-template-columns: minmax(300px, 1fr) 142px;
   column-gap: 12px;

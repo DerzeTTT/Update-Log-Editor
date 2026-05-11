@@ -82,12 +82,34 @@ type BulletDragLocation = { sectionIndex: number; sectionUiId: string; itemIndex
 type BulletDropTarget = { sectionIndex: number; sectionUiId: string; itemIndex: number; itemUiId?: string; side: "before" | "after" };
 type SectionDragLocation = { sectionIndex: number; sectionUiId: string };
 type SectionDropTarget = SectionDragLocation & { side: "before" | "after" };
+type DragScrollSnapshot = {
+  scrollTop: number;
+  scrollLeft: number;
+  windowScrollX: number;
+  windowScrollY: number;
+};
+type DragMeasuredRect = {
+  top: number;
+  bottom: number;
+  left: number;
+  right: number;
+  width: number;
+  height: number;
+  outerHeight: number;
+};
+type SectionDragRect = SectionDragLocation & DragMeasuredRect & { element: HTMLElement };
+type BulletDragRect = BulletDragLocation & DragMeasuredRect & { element: HTMLElement };
+type SectionDragLayout = DragScrollSnapshot & { sections: SectionDragRect[] };
+type BulletDragLayout = DragScrollSnapshot & { sections: SectionDragRect[]; bullets: BulletDragRect[] };
 type LauncherLifecycleWindow = typeof window & { __updateLogEditorLauncherLifecycleStarted?: boolean };
 type BulletDragSession = {
   source: BulletDragLocation;
   element: HTMLElement;
   handleElement: HTMLElement;
+  layout: BulletDragLayout;
   pointerId: number;
+  dragOriginTop: number;
+  dragOuterHeight: number;
   dragOffsetY: number;
   dragTranslateY: number;
   pointerX: number;
@@ -105,7 +127,10 @@ type SectionDragSession = {
   source: SectionDragLocation;
   element: HTMLElement;
   handleElement: HTMLElement;
+  layout: SectionDragLayout;
   pointerId: number;
+  dragOriginTop: number;
+  dragOuterHeight: number;
   dragOffsetY: number;
   dragTranslateY: number;
   pointerX: number;
@@ -1951,19 +1976,102 @@ const StructuredEditor = React.memo(function StructuredEditor({
     return { sectionIndex, sectionUiId };
   };
 
-  const getSectionDropTarget = (clientX: number, clientY: number): { target: SectionDropTarget; element: HTMLElement | null } | null => {
-    const hit = document.elementFromPoint(clientX, clientY);
-    const sectionElement = hit?.closest<HTMLElement>(".sectionEditor[data-section-index]");
-    if (!sectionElement) return null;
-    const location = readSectionLocation(sectionElement);
-    if (!location) return null;
-    const rect = sectionElement.getBoundingClientRect();
+  const measureDragRect = (element: HTMLElement): DragMeasuredRect => {
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    const marginTop = Number.parseFloat(style.marginTop) || 0;
+    const marginBottom = Number.parseFloat(style.marginBottom) || 0;
+    return {
+      top: rect.top,
+      bottom: rect.bottom,
+      left: rect.left,
+      right: rect.right,
+      width: rect.width,
+      height: rect.height,
+      outerHeight: rect.height + marginTop + marginBottom
+    };
+  };
+
+  const getDragScrollSnapshot = (): DragScrollSnapshot => ({
+    scrollTop: structuredRef.current?.scrollTop ?? 0,
+    scrollLeft: structuredRef.current?.scrollLeft ?? 0,
+    windowScrollX: window.scrollX,
+    windowScrollY: window.scrollY
+  });
+
+  const getDragScrollDeltaX = (snapshot: DragScrollSnapshot) =>
+    ((structuredRef.current?.scrollLeft ?? snapshot.scrollLeft) - snapshot.scrollLeft) +
+    (window.scrollX - snapshot.windowScrollX);
+
+  const getDragScrollDeltaY = (snapshot: DragScrollSnapshot) =>
+    ((structuredRef.current?.scrollTop ?? snapshot.scrollTop) - snapshot.scrollTop) +
+    (window.scrollY - snapshot.windowScrollY);
+
+  const getAdjustedDragRect = (snapshot: DragScrollSnapshot, rect: DragMeasuredRect): DragMeasuredRect => {
+    const deltaX = getDragScrollDeltaX(snapshot);
+    const deltaY = getDragScrollDeltaY(snapshot);
+    return {
+      ...rect,
+      top: rect.top - deltaY,
+      bottom: rect.bottom - deltaY,
+      left: rect.left - deltaX,
+      right: rect.right - deltaX
+    };
+  };
+
+  const snapshotSectionDragLayout = (): SectionDragLayout => {
+    const snapshot = getDragScrollSnapshot();
+    const sections: SectionDragRect[] = [];
+    structuredRef.current?.querySelectorAll<HTMLElement>(".sectionEditor[data-section-index]").forEach((element) => {
+      const location = readSectionLocation(element);
+      if (location) sections.push({ ...location, ...measureDragRect(element), element });
+    });
+    return { ...snapshot, sections };
+  };
+
+  const findSectionRectAtPoint = (layout: SectionDragLayout | BulletDragLayout, clientX: number, clientY: number) => {
+    for (const sectionRect of layout.sections) {
+      const adjustedRect = getAdjustedDragRect(layout, sectionRect);
+      if (
+        clientX >= adjustedRect.left &&
+        clientX <= adjustedRect.right &&
+        clientY >= adjustedRect.top &&
+        clientY <= adjustedRect.bottom
+      ) {
+        return { sectionRect, adjustedRect };
+      }
+    }
+
+    const rootRect = structuredRef.current?.getBoundingClientRect();
+    if (!rootRect || clientX < rootRect.left || clientX > rootRect.right || clientY < rootRect.top || clientY > rootRect.bottom) {
+      return null;
+    }
+
+    let closest: { sectionRect: SectionDragRect; adjustedRect: DragMeasuredRect; distance: number } | null = null;
+    for (const sectionRect of layout.sections) {
+      const adjustedRect = getAdjustedDragRect(layout, sectionRect);
+      const verticalDistance =
+        clientY < adjustedRect.top ? adjustedRect.top - clientY :
+        clientY > adjustedRect.bottom ? clientY - adjustedRect.bottom :
+        0;
+      if (!closest || verticalDistance < closest.distance) {
+        closest = { sectionRect, adjustedRect, distance: verticalDistance };
+      }
+    }
+    return closest ? { sectionRect: closest.sectionRect, adjustedRect: closest.adjustedRect } : null;
+  };
+
+  const getSectionDropTarget = (session: SectionDragSession, clientX: number, clientY: number): { target: SectionDropTarget; element: HTMLElement | null } | null => {
+    const match = findSectionRectAtPoint(session.layout, clientX, clientY);
+    if (!match) return null;
+    const { sectionRect, adjustedRect } = match;
     return {
       target: {
-        ...location,
-        side: clientY < rect.top + rect.height / 2 ? "before" : "after"
+        sectionIndex: sectionRect.sectionIndex,
+        sectionUiId: sectionRect.sectionUiId,
+        side: clientY < adjustedRect.top + adjustedRect.height / 2 ? "before" : "after"
       },
-      element: sectionElement
+      element: sectionRect.element
     };
   };
 
@@ -1984,9 +2092,8 @@ const StructuredEditor = React.memo(function StructuredEditor({
     applySectionDragPreview(session, next.target);
   };
 
-  const updateDragElementPosition = (session: Pick<SectionDragSession | BulletDragSession, "element" | "pointerY" | "dragOffsetY" | "dragTranslateY">) => {
-    const rect = session.element.getBoundingClientRect();
-    const layoutTop = rect.top - session.dragTranslateY;
+  const updateDragElementPosition = (session: Pick<SectionDragSession | BulletDragSession, "element" | "layout" | "pointerY" | "dragOriginTop" | "dragOffsetY" | "dragTranslateY">) => {
+    const layoutTop = session.dragOriginTop - getDragScrollDeltaY(session.layout);
     const nextTranslateY = session.pointerY - session.dragOffsetY - layoutTop;
     session.dragTranslateY = nextTranslateY;
     session.element.style.setProperty("--drag-y", `${nextTranslateY}px`);
@@ -2000,12 +2107,6 @@ const StructuredEditor = React.memo(function StructuredEditor({
     } catch {
       // Some browsers release pointer capture automatically when the source node moves.
     }
-  };
-
-  const getOuterBlockHeight = (element: HTMLElement) => {
-    const rect = element.getBoundingClientRect();
-    const style = window.getComputedStyle(element);
-    return rect.height + (Number.parseFloat(style.marginTop) || 0) + (Number.parseFloat(style.marginBottom) || 0);
   };
 
   const clearDragShiftPreview = (session: Pick<SectionDragSession | BulletDragSession, "shiftedElements">) => {
@@ -2030,7 +2131,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
     if (sourceIndex < 0 || targetIndex < 0) return false;
     const insertIndex = getSectionInsertIndex(sourceIndex, { ...target, sectionIndex: targetIndex }, current.sections.length);
     if (insertIndex === sourceIndex) return false;
-    const shiftBy = getOuterBlockHeight(session.element);
+    const shiftBy = session.dragOuterHeight;
     const lowerIndex = insertIndex > sourceIndex ? sourceIndex + 1 : insertIndex;
     const upperIndex = insertIndex > sourceIndex ? insertIndex : sourceIndex - 1;
     const offsetY = insertIndex > sourceIndex ? -shiftBy : shiftBy;
@@ -2093,7 +2194,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
     session.rafId = window.requestAnimationFrame(() => {
       session.rafId = null;
       updateDragElementPosition(session);
-      const nextTarget = getSectionDropTarget(session.pointerX, session.pointerY);
+      const nextTarget = getSectionDropTarget(session, session.pointerX, session.pointerY);
       setSectionDropTargetDom(session, nextTarget);
     });
   };
@@ -2150,13 +2251,21 @@ const StructuredEditor = React.memo(function StructuredEditor({
       if (!activeSession || cancelEvent.pointerId !== activeSession.pointerId) return;
       finishSectionDrag(false);
     };
-    const rect = sectionElement.getBoundingClientRect();
+    const layout = snapshotSectionDragLayout();
+    const sourceRect = layout.sections.find((sectionRect) => sectionRect.sectionUiId === location.sectionUiId) ?? {
+      ...location,
+      ...measureDragRect(sectionElement),
+      element: sectionElement
+    };
     const session: SectionDragSession = {
       source: location,
       element: sectionElement,
       handleElement: event.currentTarget,
+      layout,
       pointerId: event.pointerId,
-      dragOffsetY: event.clientY - rect.top,
+      dragOriginTop: sourceRect.top,
+      dragOuterHeight: sourceRect.outerHeight,
+      dragOffsetY: event.clientY - sourceRect.top,
       dragTranslateY: 0,
       pointerX: event.clientX,
       pointerY: event.clientY,
@@ -2176,7 +2285,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
     window.addEventListener("pointermove", onPointerMove);
     window.addEventListener("pointerup", onPointerUp);
     window.addEventListener("pointercancel", onPointerCancel);
-    setSectionDropTargetDom(session, getSectionDropTarget(event.clientX, event.clientY));
+    setSectionDropTargetDom(session, getSectionDropTarget(session, event.clientX, event.clientY));
     session.autoScrollRafId = window.requestAnimationFrame(() => runSectionAutoScroll(session));
   };
 
@@ -2196,55 +2305,63 @@ const StructuredEditor = React.memo(function StructuredEditor({
     return { sectionIndex, sectionUiId, itemIndex, itemUiId };
   };
 
-  const getBulletDropTarget = (clientX: number, clientY: number): { target: BulletDropTarget; element: HTMLElement | null } | null => {
-    const hit = document.elementFromPoint(clientX, clientY);
-    const itemElement = hit?.closest<HTMLElement>(".itemEditor[data-section-index][data-item-index]");
-    if (itemElement) {
-      const location = readBulletLocation(itemElement);
-      if (!location) return null;
-      const rect = itemElement.getBoundingClientRect();
+  const snapshotBulletDragLayout = (): BulletDragLayout => {
+    const sectionLayout = snapshotSectionDragLayout();
+    const bullets: BulletDragRect[] = [];
+    structuredRef.current?.querySelectorAll<HTMLElement>(".itemEditor[data-section-index][data-item-index]").forEach((element) => {
+      const location = readBulletLocation(element);
+      if (!location) return;
+      const measuredRect = measureDragRect(element);
+      if (measuredRect.width === 0 && measuredRect.height === 0) return;
+      bullets.push({ ...location, ...measuredRect, element });
+    });
+    return { ...sectionLayout, bullets };
+  };
+
+  const getBulletDropTarget = (session: BulletDragSession, clientX: number, clientY: number): { target: BulletDropTarget; element: HTMLElement | null } | null => {
+    const sectionMatch = findSectionRectAtPoint(session.layout, clientX, clientY);
+    if (!sectionMatch) return null;
+    const { sectionRect } = sectionMatch;
+    const sectionBullets = session.layout.bullets.filter((bulletRect) => bulletRect.sectionUiId === sectionRect.sectionUiId);
+    if (!sectionBullets.length) {
       return {
         target: {
-          ...location,
-          side: clientY < rect.top + rect.height / 2 ? "before" : "after"
+          sectionIndex: sectionRect.sectionIndex,
+          sectionUiId: sectionRect.sectionUiId,
+          itemIndex: 0,
+          side: "after"
         },
-        element: itemElement
+        element: sectionRect.element.querySelector<HTMLElement>(".sectionBodyInner")
       };
     }
 
-    const sectionElement = hit?.closest<HTMLElement>(".sectionEditor[data-section-index]");
-    if (!sectionElement) return null;
-    const sectionIndex = Number(sectionElement.dataset.sectionIndex);
-    const sectionUiId = sectionElement.dataset.sectionUiId;
-    if (!Number.isInteger(sectionIndex) || !sectionUiId) return null;
-    const itemElements = [...sectionElement.querySelectorAll<HTMLElement>(".itemEditor[data-section-index][data-item-index]")];
-    if (!itemElements.length) {
-      return {
-        target: { sectionIndex, sectionUiId, itemIndex: 0, side: "after" },
-        element: sectionElement.querySelector<HTMLElement>(".sectionBodyInner")
-      };
-    }
-
-    let closestElement = itemElements[0];
-    let closestDistance = Number.POSITIVE_INFINITY;
-    for (const candidate of itemElements) {
-      const rect = candidate.getBoundingClientRect();
-      const centerY = rect.top + rect.height / 2;
-      const distance = Math.abs(clientY - centerY);
-      if (distance < closestDistance) {
-        closestDistance = distance;
-        closestElement = candidate;
+    let closest: { bulletRect: BulletDragRect; adjustedRect: DragMeasuredRect; distance: number } | null = null;
+    for (const bulletRect of sectionBullets) {
+      const adjustedRect = getAdjustedDragRect(session.layout, bulletRect);
+      const containsY = clientY >= adjustedRect.top && clientY <= adjustedRect.bottom;
+      const containsX = clientX >= adjustedRect.left && clientX <= adjustedRect.right;
+      if (containsY && containsX) {
+        closest = { bulletRect, adjustedRect, distance: 0 };
+        break;
+      }
+      const distance =
+        clientY < adjustedRect.top ? adjustedRect.top - clientY :
+        clientY > adjustedRect.bottom ? clientY - adjustedRect.bottom :
+        0;
+      if (!closest || distance < closest.distance) {
+        closest = { bulletRect, adjustedRect, distance };
       }
     }
-    const location = readBulletLocation(closestElement);
-    if (!location) return null;
-    const rect = closestElement.getBoundingClientRect();
+    if (!closest) return null;
     return {
       target: {
-        ...location,
-        side: clientY < rect.top + rect.height / 2 ? "before" : "after"
+        sectionIndex: closest.bulletRect.sectionIndex,
+        sectionUiId: closest.bulletRect.sectionUiId,
+        itemIndex: closest.bulletRect.itemIndex,
+        itemUiId: closest.bulletRect.itemUiId,
+        side: clientY < closest.adjustedRect.top + closest.adjustedRect.height / 2 ? "before" : "after"
       },
-      element: closestElement
+      element: closest.bulletRect.element
     };
   };
 
@@ -2297,7 +2414,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
   const applyBulletDragPreview = (session: BulletDragSession, target: BulletDropTarget) => {
     const move = getBulletMove(localLogRef.current, session.source, target);
     if (!move) return false;
-    const shiftBy = getOuterBlockHeight(session.element);
+    const shiftBy = session.dragOuterHeight;
     const { sourceSectionIndex, sourceItemIndex, targetSectionIndex, insertIndex } = move;
     if (sourceSectionIndex === targetSectionIndex) {
       const sectionUiId = localLogRef.current.sections[sourceSectionIndex].uiId;
@@ -2371,7 +2488,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
     session.rafId = window.requestAnimationFrame(() => {
       session.rafId = null;
       updateDragElementPosition(session);
-      const nextTarget = getBulletDropTarget(session.pointerX, session.pointerY);
+      const nextTarget = getBulletDropTarget(session, session.pointerX, session.pointerY);
       setBulletDropTargetDom(session, nextTarget);
     });
   };
@@ -2428,13 +2545,21 @@ const StructuredEditor = React.memo(function StructuredEditor({
       if (!activeSession || cancelEvent.pointerId !== activeSession.pointerId) return;
       finishBulletDrag(false);
     };
-    const rect = itemElement.getBoundingClientRect();
+    const layout = snapshotBulletDragLayout();
+    const sourceRect = layout.bullets.find((bulletRect) => bulletRect.itemUiId === location.itemUiId) ?? {
+      ...location,
+      ...measureDragRect(itemElement),
+      element: itemElement
+    };
     const session: BulletDragSession = {
       source: location,
       element: itemElement,
       handleElement: event.currentTarget,
+      layout,
       pointerId: event.pointerId,
-      dragOffsetY: event.clientY - rect.top,
+      dragOriginTop: sourceRect.top,
+      dragOuterHeight: sourceRect.outerHeight,
+      dragOffsetY: event.clientY - sourceRect.top,
       dragTranslateY: 0,
       pointerX: event.clientX,
       pointerY: event.clientY,
@@ -2454,7 +2579,7 @@ const StructuredEditor = React.memo(function StructuredEditor({
     window.addEventListener("pointermove", onPointerMove);
     window.addEventListener("pointerup", onPointerUp);
     window.addEventListener("pointercancel", onPointerCancel);
-    setBulletDropTargetDom(session, getBulletDropTarget(event.clientX, event.clientY));
+    setBulletDropTargetDom(session, getBulletDropTarget(session, event.clientX, event.clientY));
     session.autoScrollRafId = window.requestAnimationFrame(() => runBulletAutoScroll(session));
   };
 
